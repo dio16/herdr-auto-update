@@ -9,6 +9,9 @@ use std::path::PathBuf;
 pub struct Config {
     /// Reinstall outdated plugins automatically from the startup hook.
     pub auto_update: bool,
+    /// Show a desktop notification via `herdr notification show` when
+    /// updates ran (updated and/or failed). Ignored with --json.
+    pub notify: bool,
     /// Plugin ids to skip during updates.
     pub exclude: Vec<String>,
 }
@@ -17,6 +20,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             auto_update: true,
+            notify: true,
             exclude: Vec::new(),
         }
     }
@@ -64,6 +68,7 @@ mod tests {
     fn defaults_when_no_file() {
         let cfg = load(Some("Z:/definitely/not/here/config.toml")).unwrap();
         assert!(cfg.auto_update);
+        assert!(cfg.notify);
         assert!(cfg.exclude.is_empty());
     }
 
@@ -74,11 +79,12 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "auto_update = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\n",
+            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\n",
         )
         .unwrap();
         let cfg = load(Some(path.to_str().unwrap())).unwrap();
         assert!(!cfg.auto_update);
+        assert!(!cfg.notify);
         assert_eq!(cfg.exclude, vec!["flock.farm", "wave-tui.radio"]);
         assert!(cfg.is_excluded("flock.farm"));
         assert!(!cfg.is_excluded("other"));

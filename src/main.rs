@@ -12,7 +12,7 @@ const USAGE: &str = "\
 herdr-auto-update - check/update installed herdr plugins
 
 USAGE:
-    herdr-auto-update <startup|check|update> [--json] [--config <path>]
+    herdr-auto-update <startup|check|update> [--json] [--config <path>] [--only <plugin_id>]
 
 COMMANDS:
     startup   check and reinstall outdated plugins (used by herdr's startup hook)
@@ -22,13 +22,14 @@ COMMANDS:
 FLAGS:
     --json           machine-readable output (check/update)
     --config <path>  override the plugin config file
+    --only <id>      restrict check/update to one plugin id
     -V, --version    print version
     -h, --help       print help
 
 EXIT CODES:
     0   ok / everything up to date
     1   updates available (check) or one or more reinstalls failed (update/startup)
-    2   fatal error (herdr CLI unavailable, unparsable registry, bad usage)
+    2   fatal error, bad usage, or one or more plugin checks errored
 ";
 
 fn main() -> ExitCode {
@@ -57,6 +58,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let only = match take_value(&mut args, "--only") {
+        Ok(v) => v,
+        Err(()) => {
+            eprintln!("error: --only requires a plugin id argument");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     if !args.is_empty() {
         eprintln!("error: unexpected argument(s): {}", args.join(" "));
         eprintln!("{USAGE}");
@@ -72,9 +81,16 @@ fn main() -> ExitCode {
     };
 
     match cmd.as_str() {
-        "startup" => updater::run_startup(&cfg, json),
-        "check" => updater::run_check(json),
-        "update" => updater::run_update(&cfg, json),
+        "startup" => {
+            if only.is_some() {
+                eprintln!("error: --only cannot be used with startup");
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+            updater::run_startup(&cfg, json)
+        }
+        "check" => updater::run_check(json, only.as_deref()),
+        "update" => updater::run_update(&cfg, json, only.as_deref()),
         other => {
             eprintln!("error: unknown command '{other}'");
             eprintln!("{USAGE}");

@@ -22,6 +22,8 @@ pub struct PluginStatus {
     pub plugin_id: String,
     pub owner: String,
     pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub installed_sha: String,
     pub remote_sha: Option<String>,
     pub update_available: bool,
@@ -38,11 +40,11 @@ pub fn run_startup(cfg: &Config, json: bool) -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    run_update(cfg, json)
+    run_update(cfg, json, None)
 }
 
-pub fn run_check(json: bool) -> ExitCode {
-    let statuses = match collect() {
+pub fn run_check(json: bool, only: Option<&str>) -> ExitCode {
+    let statuses = match collect(only) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -50,6 +52,7 @@ pub fn run_check(json: bool) -> ExitCode {
         }
     };
     let pending = statuses.iter().filter(|s| s.update_available).count();
+    let errors = statuses.iter().filter(|s| s.error.is_some()).count();
     if json {
         println!("{}", serde_json::to_string_pretty(&statuses).unwrap());
     } else {
@@ -57,20 +60,25 @@ pub fn run_check(json: bool) -> ExitCode {
             print_status(s);
         }
         eprintln!(
-            "[herdr-auto-update] {} plugin(s) checked, {} update(s) available",
+            "[herdr-auto-update] {} plugin(s) checked, {} update(s) available, {} error(s)",
             statuses.len(),
-            pending
+            pending,
+            errors
         );
     }
-    if pending > 0 {
+    // Errors take precedence over pending updates so scripts can tell a
+    // failed check (2) apart from "updates available" (1).
+    if errors > 0 {
+        ExitCode::from(2)
+    } else if pending > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
 }
 
-pub fn run_update(cfg: &Config, json: bool) -> ExitCode {
-    let statuses = match collect() {
+pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    let statuses = match collect(only) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -144,6 +152,7 @@ pub fn run_update(cfg: &Config, json: bool) -> ExitCode {
             updated.len(),
             failed.len()
         );
+        notify(cfg, updated.len(), failed.len());
     }
 
     if failed.is_empty() {
@@ -151,6 +160,23 @@ pub fn run_update(cfg: &Config, json: bool) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+/// Best-effort desktop notification through herdr's CLI. Failures are
+/// ignored: a missing notification API must not change the exit code.
+fn notify(cfg: &Config, updated: usize, failed: usize) {
+    if !cfg.notify || (updated == 0 && failed == 0) {
+        return;
+    }
+    let body = match (updated, failed) {
+        (0, f) => format!("{f} plugin update(s) failed"),
+        (u, 0) => format!("{u} plugin(s) updated"),
+        (u, f) => format!("{u} updated, {f} failed"),
+    };
+    let bin = registry::herdr_bin();
+    let _ = Command::new(&bin)
+        .args(["notification", "show", "herdr-auto-update", "--body", &body])
+        .status();
 }
 
 /// Reinstall one plugin through herdr's own installer (herdr v1 has no
@@ -178,77 +204,152 @@ fn apply_update(owner: &str, repo: &str, requested_ref: Option<&str>) -> bool {
     }
 }
 
-fn collect() -> Result<Vec<PluginStatus>, String> {
+/// A plugin whose remote commit still needs resolving (network call).
+struct RemoteJob {
+    index: usize,
+    plugin_id: String,
+    owner: String,
+    repo: String,
+    version: Option<String>,
+    installed_sha: String,
+    requested_ref: Option<String>,
+}
+
+/// With `only`, restrict to one plugin id; an id that is absent from the
+/// registry, or not a GitHub-installed plugin, is a hard error so `--only`
+/// can never silently no-op.
+fn collect(only: Option<&str>) -> Result<Vec<PluginStatus>, String> {
     let plugins = registry::list_installed()?;
-    let mut out = Vec::new();
-    for p in plugins {
-        let Some(src) = &p.source else { continue };
+
+    // Resolve each plugin to either an immediate status (skipped kinds,
+    // invalid entries) or a remote-resolution job. The remote checks run in
+    // parallel below so a slow network cannot multiply across plugins.
+    let mut statuses: Vec<Option<PluginStatus>> = Vec::with_capacity(plugins.len());
+    let mut jobs: Vec<RemoteJob> = Vec::new();
+    let mut matched = false;
+
+    for (i, p) in plugins.iter().enumerate() {
+        if let Some(o) = only {
+            if p.plugin_id != o {
+                statuses.push(None);
+                continue;
+            }
+            matched = true;
+        }
+        let Some(src) = &p.source else {
+            if let Some(o) = only {
+                return Err(format!("plugin '{o}' is not a GitHub-installed plugin"));
+            }
+            statuses.push(None);
+            continue;
+        };
         if src.kind != registry::GITHUB_KIND {
+            if let Some(o) = only {
+                return Err(format!("plugin '{o}' is not a GitHub-installed plugin"));
+            }
+            statuses.push(None);
             continue; // local links and other kinds are not updatable
         }
         // A github entry may be missing owner/repo/resolved_commit (e.g. a
         // stale registry row); treat it as invalid instead of panicking.
         let (Some(owner), Some(repo), Some(rc)) = (&src.owner, &src.repo, &src.resolved_commit)
         else {
-            out.push(PluginStatus {
+            statuses.push(Some(PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: src.owner.clone().unwrap_or_default(),
                 repo: src.repo.clone().unwrap_or_default(),
+                version: p.version.clone(),
                 installed_sha: src.resolved_commit.clone().unwrap_or_default(),
                 remote_sha: None,
                 update_available: false,
                 requested_ref: src.requested_ref.clone(),
                 error: Some("github source missing owner/repo/commit fields".to_string()),
-            });
+            }));
             continue;
         };
         if !registry::valid_github_name(owner, 39) || !registry::valid_github_name(repo, 100) {
-            out.push(PluginStatus {
+            statuses.push(Some(PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: owner.clone(),
                 repo: repo.clone(),
+                version: p.version.clone(),
                 installed_sha: rc.clone(),
                 remote_sha: None,
                 update_available: false,
                 requested_ref: src.requested_ref.clone(),
                 error: Some("invalid owner/repo recorded in registry".to_string()),
-            });
+            }));
             continue;
         }
-        match remote_head(owner, repo, src.requested_ref.as_deref()) {
-            Ok(Some(sha)) => out.push(PluginStatus {
-                plugin_id: p.plugin_id.clone(),
-                owner: owner.clone(),
-                repo: repo.clone(),
-                installed_sha: rc.clone(),
-                remote_sha: Some(sha.clone()),
-                update_available: sha != *rc,
-                requested_ref: src.requested_ref.clone(),
-                error: None,
-            }),
-            Ok(None) => out.push(PluginStatus {
-                plugin_id: p.plugin_id.clone(),
-                owner: owner.clone(),
-                repo: repo.clone(),
-                installed_sha: rc.clone(),
-                remote_sha: None,
-                update_available: false,
-                requested_ref: src.requested_ref.clone(),
-                error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
-            }),
-            Err(e) => out.push(PluginStatus {
-                plugin_id: p.plugin_id.clone(),
-                owner: owner.clone(),
-                repo: repo.clone(),
-                installed_sha: rc.clone(),
-                remote_sha: None,
-                update_available: false,
-                requested_ref: src.requested_ref.clone(),
-                error: Some(e),
-            }),
+        jobs.push(RemoteJob {
+            index: i,
+            plugin_id: p.plugin_id.clone(),
+            owner: owner.clone(),
+            repo: repo.clone(),
+            version: p.version.clone(),
+            installed_sha: rc.clone(),
+            requested_ref: src.requested_ref.clone(),
+        });
+        statuses.push(None);
+    }
+    if let Some(o) = only {
+        if !matched {
+            return Err(format!("plugin '{o}' not found in the herdr registry"));
         }
     }
-    Ok(out)
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|job| {
+                let owner = job.owner.clone();
+                let repo = job.repo.clone();
+                let requested_ref = job.requested_ref.clone();
+                scope.spawn(move || remote_head(&owner, &repo, requested_ref.as_deref()))
+            })
+            .collect();
+        for (handle, job) in handles.into_iter().zip(&jobs) {
+            let result = handle.join().expect("remote_head thread panicked");
+            let status = match result {
+                Ok(Some(sha)) => PluginStatus {
+                    plugin_id: job.plugin_id.clone(),
+                    owner: job.owner.clone(),
+                    repo: job.repo.clone(),
+                    version: job.version.clone(),
+                    installed_sha: job.installed_sha.clone(),
+                    remote_sha: Some(sha.clone()),
+                    update_available: sha != job.installed_sha,
+                    requested_ref: job.requested_ref.clone(),
+                    error: None,
+                },
+                Ok(None) => PluginStatus {
+                    plugin_id: job.plugin_id.clone(),
+                    owner: job.owner.clone(),
+                    repo: job.repo.clone(),
+                    version: job.version.clone(),
+                    installed_sha: job.installed_sha.clone(),
+                    remote_sha: None,
+                    update_available: false,
+                    requested_ref: job.requested_ref.clone(),
+                    error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
+                },
+                Err(e) => PluginStatus {
+                    plugin_id: job.plugin_id.clone(),
+                    owner: job.owner.clone(),
+                    repo: job.repo.clone(),
+                    version: job.version.clone(),
+                    installed_sha: job.installed_sha.clone(),
+                    remote_sha: None,
+                    update_available: false,
+                    requested_ref: job.requested_ref.clone(),
+                    error: Some(e),
+                },
+            };
+            statuses[job.index] = Some(status);
+        }
+    });
+
+    Ok(statuses.into_iter().flatten().collect())
 }
 
 /// Resolve the remote commit for a plugin: its pinned ref when

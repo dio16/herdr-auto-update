@@ -15,11 +15,16 @@ which replaces the managed checkout while preserving plugin config and state.
   `git ls-remote`) and reinstalls the outdated ones. Plugins installed with
   `herdr plugin install --ref` keep their pin: they are compared and
   reinstalled against that same ref, never moved to `HEAD`.
+- Remote checks run in parallel, so the check time is one network round trip
+  regardless of how many plugins are installed.
 - Automatic check + reinstall at herdr server startup (toggleable).
+- Desktop notification when updates ran (`herdr notification show`,
+  toggleable).
 - Manual actions: `check` / `update` (bind keys in your herdr config).
-- Standalone CLI with human and `--json` output and scriptable exit codes.
+- Standalone CLI with human and `--json` output and scriptable exit codes,
+  including `--only <plugin_id>` to target a single plugin.
 - `exclude` list for plugins you do not want touched.
-- Windows and Linux (WSL) support; Rust binary with argv-based subprocess
+- Linux, macOS, and Windows support; Rust binary with argv-based subprocess
   calls (no shell interpolation).
 
 ## Requirements
@@ -62,23 +67,87 @@ herdr-auto-update`):
 # Reinstall outdated plugins automatically at server startup (default true).
 auto_update = true
 
+# Show a desktop notification when updates ran (default true). Notifications
+# are suppressed when --json is used.
+notify = true
+
 # Plugin ids to skip during updates.
 exclude = ["flock.farm"]
 ```
 
 ## CLI
 
-```text
-herdr-auto-update <startup|check|update> [--json] [--config <path>]
-
-exit codes:
-  0  ok / everything up to date
-  1  updates available (check) or one or more reinstalls failed (update/startup)
-  2  fatal error (herdr CLI unavailable, unparsable registry, bad usage)
-```
-
 When herdr runs the plugin it injects `HERDR_BIN_PATH`; for standalone use the
 `herdr` binary is resolved from PATH.
+
+### Check for updates
+
+`herdr-auto-update check` — report which GitHub-installed plugins have newer
+commits upstream. Exits `1` when updates are available, `2` when any plugin
+check errored, `0` otherwise.
+
+```bash
+herdr-auto-update check
+```
+
+### Check with JSON output
+
+`herdr-auto-update check --json` — same check, machine-readable output as a
+JSON array of plugin statuses (one object per plugin with `plugin_id`, `owner`,
+`repo`, `version`, `installed_sha`, `remote_sha`, `update_available`,
+`requested_ref`, `error`).
+
+```bash
+herdr-auto-update check --json
+```
+
+### Update plugins
+
+`herdr-auto-update update` — reinstall every outdated plugin through
+`herdr plugin install`. Exits `1` when one or more reinstalls failed. Shows a
+notification when updates ran (unless `notify = false`).
+
+```bash
+herdr-auto-update update
+```
+
+### Update one plugin
+
+`herdr-auto-update update --only <plugin_id>` — restrict check/update to a
+single plugin id. An id that is not in the registry, or not a GitHub-installed
+plugin, is a fatal error (exit `2`).
+
+```bash
+herdr-auto-update update --only flock.farm
+```
+
+### Startup hook
+
+`herdr-auto-update startup` — what herdr runs at server startup: check and
+reinstall outdated plugins, unless `auto_update = false` in the config. Not
+meant to be run by hand.
+
+```bash
+herdr-auto-update startup
+```
+
+### Common flags
+
+| Flag | Description |
+|---|---|
+| `--json` | machine-readable output (check/update; suppresses notifications) |
+| `--config <path>` | override the plugin config file |
+| `--only <plugin_id>` | restrict check/update to one plugin id |
+| `-V, --version` | print the version |
+| `-h, --help` | print help |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | ok / everything up to date |
+| `1` | updates available (check) or one or more reinstalls failed (update/startup) |
+| `2` | fatal error, bad usage, or one or more plugin checks errored |
 
 ## Development
 

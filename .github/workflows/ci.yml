@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,3 +25,6 @@ jobs:
         run: cargo test --all-targets
       - name: Release build
         run: cargo build --release
+      - name: Launcher smoke test (unix)
+        if: runner.os != 'Windows'
+        run: sh scripts/run.sh --version

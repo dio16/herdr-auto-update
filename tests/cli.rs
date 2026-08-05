@@ -67,6 +67,10 @@ if [ "$1" = "plugin" ] && [ "$2" = "install" ]; then
   echo "$@" >> "$(dirname "$0")/installs.log"
   exit 0
 fi
+if [ "$1" = "notification" ] && [ "$2" = "show" ]; then
+  echo "$@" >> "$(dirname "$0")/notifications.log"
+  exit 0
+fi
 exit 1
 "#;
 
@@ -77,6 +81,10 @@ if \"%1\"==\"plugin\" if \"%2\"==\"list\" (\r\n\
 )\r\n\
 if \"%1\"==\"plugin\" if \"%2\"==\"install\" (\r\n\
   echo %*>> \"%~dp0installs.log\"\r\n\
+  exit /b 0\r\n\
+)\r\n\
+if \"%1\"==\"notification\" if \"%2\"==\"show\" (\r\n\
+  echo %*>> \"%~dp0notifications.log\"\r\n\
   exit /b 0\r\n\
 )\r\n\
 exit /b 1\r\n";
@@ -145,11 +153,29 @@ fn installs(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("installs.log")).unwrap_or_default()
 }
 
+fn notifications(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("notifications.log")).unwrap_or_default()
+}
+
+fn write_registry(dir: &Path, registry: &str) {
+    std::fs::write(dir.join("registry.json"), registry).unwrap();
+}
+
+/// Registry without error entries (no unresolvable/evil plugins), used to
+/// test exit code 1 for pending updates without errors.
+const CLEAN_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
+  {"plugin_id":"flock.farm","version":"0.1.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3"}},
+  {"plugin_id":"herdr-file-viewer","version":"1.14.0","source":{"kind":"github","owner":"smarzban","repo":"herdr-file-viewer","resolved_commit":"350f3f5be79d136933ba36c8c8dd60f79df28002"}},
+  {"plugin_id":"pinned.old","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"2222222222222222222222222222222222222222","requested_ref":"refs/heads/stable"}}
+]}}"#;
+
 #[test]
-fn check_reports_status_and_exit_1_when_update_pending() {
+fn check_reports_status_and_exit_2_when_errors() {
     let dir = setup("check");
     let out = run(&dir, &["check"], None);
-    assert_eq!(out.status.code(), Some(1));
+    // wave-tui (unresolvable), broken (missing fields), evil (invalid name)
+    // are errors, which take precedence over pending updates.
+    assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
     assert!(s.contains("up to date (ae24844b)"), "flock: {s}");
     assert!(s.contains("update available"), "file-viewer: {s}");
@@ -162,16 +188,40 @@ fn check_reports_status_and_exit_1_when_update_pending() {
 }
 
 #[test]
+fn check_exit_1_when_pending_without_errors() {
+    let dir = setup("check-clean");
+    write_registry(&dir, CLEAN_REGISTRY);
+    let out = run(&dir, &["check"], None);
+    assert_eq!(out.status.code(), Some(1));
+    let s = stdout_of(&out);
+    assert!(s.contains("herdr-file-viewer"), "{s}");
+    assert!(!s.contains("error:"), "{s}");
+}
+
+#[test]
 fn check_json_is_valid_and_marked() {
     let dir = setup("check-json");
     let out = run(&dir, &["check", "--json"], None);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
     assert!(s.trim_start().starts_with('['), "json array expected: {s}");
     assert!(s.contains("\"plugin_id\": \"herdr-file-viewer\""), "{s}");
     assert!(s.contains("\"update_available\": true"), "{s}");
     assert!(s.contains("\"plugin_id\": \"evil\""), "{s}");
     assert!(s.contains("\"error\": \"invalid owner/repo"), "{s}");
+}
+
+#[test]
+fn check_json_includes_version_and_ref() {
+    let dir = setup("check-json-meta");
+    let out = run(&dir, &["check", "--json"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let s = stdout_of(&out);
+    assert!(s.contains("\"version\": \"1.14.0\""), "{s}");
+    assert!(
+        s.contains("\"requested_ref\": \"refs/heads/stable\""),
+        "{s}"
+    );
 }
 
 #[test]
@@ -277,7 +327,7 @@ fn config_flag_with_flag_as_value_is_usage_error() {
 fn check_pinned_compares_against_ref_not_head() {
     let dir = setup("check-pinned");
     let out = run(&dir, &["check"], None);
-    assert_eq!(out.status.code(), Some(1)); // herdr-file-viewer is pending
+    assert_eq!(out.status.code(), Some(2)); // registry has error entries
     let s = stdout_of(&out);
     // herdr-flock HEAD is ae24844b, but the pinned ref resolves to 11111111;
     // pinned.stable matches the ref (up to date) while pinned.old does not.
@@ -310,6 +360,87 @@ fn update_passes_ref_flag_for_pinned_plugins() {
         .filter(|l| l.contains("ragamo/herdr-flock"))
         .collect();
     assert_eq!(flock_installs.len(), 1, "install log: {log}");
+}
+
+#[test]
+fn update_notifies_after_updates() {
+    let dir = setup("update-notify");
+    let out = run(&dir, &["update"], None);
+    assert_eq!(out.status.code(), Some(0));
+    let n = notifications(&dir);
+    assert!(
+        n.contains("herdr-auto-update") && n.contains("2 plugin(s) updated"),
+        "notification log: {n}"
+    );
+}
+
+#[test]
+fn update_notify_can_be_disabled() {
+    let dir = setup("update-notify-off");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "notify = false\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(notifications(&dir), "", "notify=false must not notify");
+}
+
+#[test]
+fn update_notify_skipped_when_nothing_to_do() {
+    let dir = setup("update-notify-idle");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "exclude = [\"herdr-file-viewer\"]\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    // herdr-file-viewer excluded, pinned.old still updated -> notify fires.
+    let n = notifications(&dir);
+    assert!(n.contains("1 plugin(s) updated"), "notification log: {n}");
+}
+
+#[test]
+fn update_only_restricts_install() {
+    let dir = setup("update-only");
+    let out = run(&dir, &["update", "--only", "herdr-file-viewer"], None);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = installs(&dir);
+    assert!(
+        log.contains("smarzban/herdr-file-viewer"),
+        "install log: {log}"
+    );
+    assert!(
+        !log.contains("ragamo/herdr-flock"),
+        "--only must skip other plugins: {log}"
+    );
+}
+
+#[test]
+fn update_only_unknown_plugin_is_fatal() {
+    let dir = setup("update-only-missing");
+    let out = run(&dir, &["update", "--only", "nope"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+    assert_eq!(installs(&dir), "");
+}
+
+#[test]
+fn update_only_local_plugin_is_fatal() {
+    let dir = setup("update-only-local");
+    let out = run(&dir, &["update", "--only", "linked-dev"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a GitHub-installed plugin"));
+    assert_eq!(installs(&dir), "");
+}
+
+#[test]
+fn update_json_does_not_notify() {
+    let dir = setup("update-json-notify");
+    let out = run(&dir, &["update", "--json"], None);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(notifications(&dir), "", "--json must not notify");
 }
 
 #[test]

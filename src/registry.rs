@@ -12,6 +12,8 @@ pub struct Plugin {
     #[serde(rename = "plugin_id")]
     pub plugin_id: String,
     #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
     pub source: Option<Source>,
 }
 
