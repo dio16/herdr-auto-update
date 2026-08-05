@@ -12,7 +12,9 @@ which replaces the managed checkout while preserving plugin config and state.
 ## Features
 
 - Checks every GitHub-installed plugin against its upstream `HEAD` (via
-  `git ls-remote`) and reinstalls the outdated ones.
+  `git ls-remote`) and reinstalls the outdated ones. Plugins installed with
+  `herdr plugin install --ref` keep their pin: they are compared and
+  reinstalled against that same ref, never moved to `HEAD`.
 - Automatic check + reinstall at herdr server startup (toggleable).
 - Manual actions: `check` / `update` (bind keys in your herdr config).
 - Standalone CLI with human and `--json` output and scriptable exit codes.

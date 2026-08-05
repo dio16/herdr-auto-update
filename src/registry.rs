@@ -22,6 +22,8 @@ pub struct Source {
     pub owner: Option<String>,
     #[serde(default)]
     pub repo: Option<String>,
+    #[serde(default)]
+    pub requested_ref: Option<String>,
     #[serde(default, rename = "resolved_commit")]
     pub resolved_commit: Option<String>,
 }

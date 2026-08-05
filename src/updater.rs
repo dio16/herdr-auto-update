@@ -26,6 +26,8 @@ pub struct PluginStatus {
     pub remote_sha: Option<String>,
     pub update_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -109,14 +111,20 @@ pub fn run_update(cfg: &Config, json: bool) -> ExitCode {
             continue;
         }
         if !json {
+            let pin = s
+                .requested_ref
+                .as_deref()
+                .map(|r| format!(" (pinned {r})"))
+                .unwrap_or_default();
             println!(
-                "  [{}] updating {} -> {}",
+                "  [{}] updating {} -> {}{}",
                 s.plugin_id,
                 short(&s.installed_sha),
-                short(s.remote_sha.as_deref().unwrap_or("?"))
+                short(s.remote_sha.as_deref().unwrap_or("?")),
+                pin
             );
         }
-        if apply_update(&s.owner, &s.repo) {
+        if apply_update(&s.owner, &s.repo, s.requested_ref.as_deref()) {
             updated.push(s.plugin_id.clone());
         } else {
             failed.push(s.plugin_id.clone());
@@ -147,15 +155,17 @@ pub fn run_update(cfg: &Config, json: bool) -> ExitCode {
 
 /// Reinstall one plugin through herdr's own installer (herdr v1 has no
 /// dedicated `plugin update`; reinstall replaces the managed checkout while
-/// preserving plugin config/state). Flag order matters: `--yes` must come
-/// after the positional.
-fn apply_update(owner: &str, repo: &str) -> bool {
+/// preserving plugin config/state). A plugin pinned with `--ref` at install
+/// time is reinstalled against the same ref, not the default branch.
+fn apply_update(owner: &str, repo: &str, requested_ref: Option<&str>) -> bool {
     let bin = registry::herdr_bin();
     let spec = format!("{owner}/{repo}");
-    match Command::new(&bin)
-        .args(["plugin", "install", &spec, "--yes"])
-        .status()
-    {
+    let mut cmd = Command::new(&bin);
+    cmd.arg("plugin").arg("install").arg(&spec);
+    if let Some(r) = requested_ref {
+        cmd.args(["--ref", r]);
+    }
+    match cmd.arg("--yes").status() {
         Ok(s) if s.success() => true,
         Ok(s) => {
             eprintln!("  install for {spec} failed with {s}");
@@ -187,6 +197,7 @@ fn collect() -> Result<Vec<PluginStatus>, String> {
                 installed_sha: src.resolved_commit.clone().unwrap_or_default(),
                 remote_sha: None,
                 update_available: false,
+                requested_ref: src.requested_ref.clone(),
                 error: Some("github source missing owner/repo/commit fields".to_string()),
             });
             continue;
@@ -199,11 +210,12 @@ fn collect() -> Result<Vec<PluginStatus>, String> {
                 installed_sha: rc.clone(),
                 remote_sha: None,
                 update_available: false,
+                requested_ref: src.requested_ref.clone(),
                 error: Some("invalid owner/repo recorded in registry".to_string()),
             });
             continue;
         }
-        match remote_head(owner, repo) {
+        match remote_head(owner, repo, src.requested_ref.as_deref()) {
             Ok(Some(sha)) => out.push(PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: owner.clone(),
@@ -211,6 +223,7 @@ fn collect() -> Result<Vec<PluginStatus>, String> {
                 installed_sha: rc.clone(),
                 remote_sha: Some(sha.clone()),
                 update_available: sha != *rc,
+                requested_ref: src.requested_ref.clone(),
                 error: None,
             }),
             Ok(None) => out.push(PluginStatus {
@@ -220,6 +233,7 @@ fn collect() -> Result<Vec<PluginStatus>, String> {
                 installed_sha: rc.clone(),
                 remote_sha: None,
                 update_available: false,
+                requested_ref: src.requested_ref.clone(),
                 error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
             }),
             Err(e) => out.push(PluginStatus {
@@ -229,6 +243,7 @@ fn collect() -> Result<Vec<PluginStatus>, String> {
                 installed_sha: rc.clone(),
                 remote_sha: None,
                 update_available: false,
+                requested_ref: src.requested_ref.clone(),
                 error: Some(e),
             }),
         }
@@ -236,11 +251,21 @@ fn collect() -> Result<Vec<PluginStatus>, String> {
     Ok(out)
 }
 
-fn remote_head(owner: &str, repo: &str) -> Result<Option<String>, String> {
+/// Resolve the remote commit for a plugin: its pinned ref when
+/// `requested_ref` is set (plugins installed with `--ref`), otherwise the
+/// default branch HEAD.
+fn remote_head(
+    owner: &str,
+    repo: &str,
+    requested_ref: Option<&str>,
+) -> Result<Option<String>, String> {
     let url = format!("https://github.com/{owner}/{repo}");
+    let mut args: Vec<&str> = GIT_TIMEOUT_ARGS.to_vec();
+    args.push("ls-remote");
+    args.push(&url);
+    args.push(requested_ref.unwrap_or("HEAD"));
     let out = Command::new(git_bin())
-        .args(GIT_TIMEOUT_ARGS)
-        .args(["ls-remote", &url, "HEAD"])
+        .args(args)
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     if !out.status.success() {

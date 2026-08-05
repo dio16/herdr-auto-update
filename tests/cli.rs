@@ -13,28 +13,47 @@ const REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
   {"plugin_id":"linked-dev","version":"0.1.0","source":{"kind":"local","path":"C:\\dev\\some-plugin"}},
   {"plugin_id":"local-thing","version":"1.0.0"},
   {"plugin_id":"broken","source":{"kind":"github","repo":"x","resolved_commit":"0000000000000000000000000000000000000000"}},
-  {"plugin_id":"evil","source":{"kind":"github","owner":"bad;rm -rf","repo":"x","resolved_commit":"0000000000000000000000000000000000000000"}}
+  {"plugin_id":"evil","source":{"kind":"github","owner":"bad;rm -rf","repo":"x","resolved_commit":"0000000000000000000000000000000000000000"}},
+  {"plugin_id":"pinned.stable","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"1111111111111111111111111111111111111111","requested_ref":"refs/heads/stable"}},
+  {"plugin_id":"pinned.old","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"2222222222222222222222222222222222222222","requested_ref":"refs/heads/stable"}}
 ]}}"#;
 
 // stub git answers: herdr-flock = same sha as installed (up to date),
 // herdr-file-viewer = newer sha (update available), anything else = failure.
+// A `refs/*` argument (pinned plugin) resolves herdr-flock to a different sha.
 const STUB_GIT_SH: &str = r#"#!/bin/sh
 url=""
+ref=""
 for a in "$@"; do
   case "$a" in
     https://github.com/*) url="$a" ;;
+    refs/*) ref="$a" ;;
   esac
 done
 case "$url" in
-  *herdr-flock*) echo "ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD" ;;
+  *herdr-flock*)
+    if [ -n "$ref" ]; then
+      echo "1111111111111111111111111111111111111111 HEAD"
+    else
+      echo "ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD"
+    fi
+    ;;
   *herdr-file-viewer*) echo "71d4c1c3706e7958c714789b035a99d949620a9e HEAD" ;;
   *) exit 1 ;;
 esac
 "#;
 
 const STUB_GIT_CMD: &str = "@echo off\r\n\
+set \"has_ref=no\"\r\n\
+for %%a in (%*) do (\r\n\
+  echo %%a | findstr /c:\"refs/\" >nul\r\n\
+  if not errorlevel 1 set \"has_ref=yes\"\r\n\
+)\r\n\
 echo %* | findstr /c:\"herdr-flock\" >nul\r\n\
-if not errorlevel 1 ( echo ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD & exit /b 0 )\r\n\
+if not errorlevel 1 (\r\n\
+  if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 HEAD & exit /b 0 )\r\n\
+  echo ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD & exit /b 0\r\n\
+)\r\n\
 echo %* | findstr /c:\"herdr-file-viewer\" >nul\r\n\
 if not errorlevel 1 ( echo 71d4c1c3706e7958c714789b035a99d949620a9e HEAD & exit /b 0 )\r\n\
 exit /b 1\r\n";
@@ -45,7 +64,7 @@ if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then
   exit 0
 fi
 if [ "$1" = "plugin" ] && [ "$2" = "install" ]; then
-  echo "$3" >> "$(dirname "$0")/installs.log"
+  echo "$@" >> "$(dirname "$0")/installs.log"
   exit 0
 fi
 exit 1
@@ -57,7 +76,7 @@ if \"%1\"==\"plugin\" if \"%2\"==\"list\" (\r\n\
   exit /b 0\r\n\
 )\r\n\
 if \"%1\"==\"plugin\" if \"%2\"==\"install\" (\r\n\
-  echo %3>> \"%~dp0installs.log\"\r\n\
+  echo %*>> \"%~dp0installs.log\"\r\n\
   exit /b 0\r\n\
 )\r\n\
 exit /b 1\r\n";
@@ -167,14 +186,17 @@ fn update_reinstalls_only_outdated_via_herdr_cli() {
     );
     let log = installs(&dir);
     assert!(
-        log.contains("smarzban/herdr-file-viewer"),
+        log.contains("plugin install smarzban/herdr-file-viewer --yes"),
         "install log: {log}"
     );
+    // flock.farm is up to date and pinned.stable matches its pinned ref, so
+    // neither may be reinstalled against HEAD; only pinned.old (via --ref)
+    // may reinstall herdr-flock.
     assert!(
-        !log.contains("ragamo/herdr-flock"),
-        "up-to-date plugin must not be reinstalled: {log}"
+        !log.contains("plugin install ragamo/herdr-flock --yes"),
+        "up-to-date plugin must not be reinstalled against HEAD: {log}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("1 updated, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("2 updated, 0 failed"));
 }
 
 #[test]
@@ -188,10 +210,10 @@ fn update_respects_exclude_list() {
     .unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(
-        installs(&dir),
-        "",
-        "excluded plugin must not be reinstalled"
+    let log = installs(&dir);
+    assert!(
+        !log.contains("herdr-file-viewer"),
+        "excluded plugin must not be reinstalled: {log}"
     );
     assert!(stdout_of(&out).contains("excluded"));
 }
@@ -249,6 +271,45 @@ fn config_flag_with_flag_as_value_is_usage_error() {
     let out = run(&dir, &["check", "--config", "--json"], None);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("USAGE"));
+}
+
+#[test]
+fn check_pinned_compares_against_ref_not_head() {
+    let dir = setup("check-pinned");
+    let out = run(&dir, &["check"], None);
+    assert_eq!(out.status.code(), Some(1)); // herdr-file-viewer is pending
+    let s = stdout_of(&out);
+    // herdr-flock HEAD is ae24844b, but the pinned ref resolves to 11111111;
+    // pinned.stable matches the ref (up to date) while pinned.old does not.
+    let stable: Vec<&str> = s.lines().filter(|l| l.contains("pinned.stable")).collect();
+    assert_eq!(stable.len(), 1, "{s}");
+    assert!(stable[0].contains("up to date"), "{s}");
+    let old: Vec<&str> = s.lines().filter(|l| l.contains("pinned.old")).collect();
+    assert_eq!(old.len(), 1, "{s}");
+    assert!(old[0].contains("update available"), "{s}");
+}
+
+#[test]
+fn update_passes_ref_flag_for_pinned_plugins() {
+    let dir = setup("update-pinned");
+    let out = run(&dir, &["update"], None);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = installs(&dir);
+    assert!(
+        log.contains("ragamo/herdr-flock --ref refs/heads/stable"),
+        "pinned reinstall must keep the ref: {log}"
+    );
+    // pinned.stable matches the pinned ref and must not be reinstalled.
+    let flock_installs: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("ragamo/herdr-flock"))
+        .collect();
+    assert_eq!(flock_installs.len(), 1, "install log: {log}");
 }
 
 #[test]
