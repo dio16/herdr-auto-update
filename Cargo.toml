@@ -1,0 +1,19 @@
+[package]
+name = "herdr-auto-update"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "herdr plugin: check installed plugins for newer upstream commits and reinstall them, optionally at server startup"
+license = "MIT"
+keywords = ["herdr", "plugin", "update", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

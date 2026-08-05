@@ -1,0 +1,48 @@
+id = "herdr-auto-update"
+name = "herdr-auto-update"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Check installed herdr plugins for newer upstream commits and reinstall them; optionally runs automatically at herdr startup"
+platforms = ["linux", "windows"]
+
+# Build step run by `herdr plugin install`. Requires a Rust toolchain.
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# Auto check + reinstall at herdr server startup (respects config auto_update).
+[[startup]]
+platforms = ["linux"]
+command = ["sh", "scripts/run.sh", "startup"]
+
+[[startup]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run.ps1", "startup"]
+
+# Manual actions (ids are unique per platform because herdr rejects duplicates).
+[[actions]]
+id = "check"
+title = "Check herdr plugin updates"
+contexts = ["workspace"]
+platforms = ["linux"]
+command = ["sh", "scripts/run.sh", "check"]
+
+[[actions]]
+id = "check-windows"
+title = "Check herdr plugin updates"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run.ps1", "check"]
+
+[[actions]]
+id = "update"
+title = "Update herdr plugins"
+contexts = ["workspace"]
+platforms = ["linux"]
+command = ["sh", "scripts/run.sh", "update"]
+
+[[actions]]
+id = "update-windows"
+title = "Update herdr plugins"
+contexts = ["workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run.ps1", "update"]
