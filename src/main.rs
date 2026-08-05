@@ -49,7 +49,14 @@ fn main() -> ExitCode {
 
     let cmd = args.remove(0);
     let json = take_flag(&mut args, "--json");
-    let config_path = take_value(&mut args, "--config");
+    let config_path = match take_value(&mut args, "--config") {
+        Ok(v) => v,
+        Err(()) => {
+            eprintln!("error: --config requires a path argument");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     if !args.is_empty() {
         eprintln!("error: unexpected argument(s): {}", args.join(" "));
         eprintln!("{USAGE}");
@@ -85,15 +92,18 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
     }
 }
 
-fn take_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
+/// Remove `--flag <value>` from args. `Err(())` when the flag is present but
+/// has no value, or the next argument is another flag (so `--config --json`
+/// is not silently interpreted as a config path).
+fn take_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, ()> {
     if let Some(i) = args.iter().position(|a| a == flag) {
         args.remove(i);
-        if i < args.len() {
-            Some(args.remove(i))
+        if i < args.len() && !args[i].starts_with('-') {
+            Ok(Some(args.remove(i)))
         } else {
-            None
+            Err(())
         }
     } else {
-        None
+        Ok(None)
     }
 }

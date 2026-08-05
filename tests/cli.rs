@@ -236,6 +236,22 @@ fn unknown_command_is_usage_error() {
 }
 
 #[test]
+fn config_flag_without_value_is_usage_error() {
+    let dir = setup("config-no-value");
+    let out = run(&dir, &["check", "--config"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("USAGE"));
+}
+
+#[test]
+fn config_flag_with_flag_as_value_is_usage_error() {
+    let dir = setup("config-flag-value");
+    let out = run(&dir, &["check", "--config", "--json"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("USAGE"));
+}
+
+#[test]
 fn missing_herdr_cli_is_fatal() {
     let dir = setup("no-herdr");
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-auto-update"))

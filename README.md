@@ -45,6 +45,11 @@ command = "herdr-auto-update.update"
 description = "Update herdr plugins"
 ```
 
+On Windows the action ids are suffixed with `-windows`
+(`herdr-auto-update.update-windows`, `herdr-auto-update.check-windows`) because
+herdr requires action ids to be unique within a plugin. `herdr plugin action
+list` prints the exact ids for your platform.
+
 ## Configuration
 
 The plugin reads `config.toml` from its plugin config directory (created by
@@ -81,6 +86,9 @@ cargo build --release
 cargo clippy -- -D warnings
 cargo test
 ```
+
+To be listed in the herdr marketplace, add the `herdr-plugin` topic to the
+repository on GitHub (the index refreshes automatically).
 
 ## Security notes
 
