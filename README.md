@@ -31,7 +31,7 @@ which replaces the managed checkout while preserving plugin config and state.
 ## Install
 
 ```bash
-herdr plugin install <owner>/herdr-auto-update
+herdr plugin install dio16/herdr-auto-update
 ```
 
 Enable the actions you want in `~/.config/herdr/config.toml`
