@@ -186,6 +186,15 @@ fn write_registry(dir: &Path, registry: &str) {
     std::fs::write(dir.join("registry.json"), registry).unwrap();
 }
 
+/// Write a config with `policy = "auto"` (v1.0's default is notify) plus
+/// `extra`, return its path. Most update-path tests assert install behavior,
+/// so they opt into the auto policy explicitly.
+fn auto_cfg(dir: &Path, extra: &str) -> PathBuf {
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, format!("policy = \"auto\"\n{extra}")).unwrap();
+    cfg
+}
+
 /// Single github plugin whose stub git hangs forever; used by the
 /// hard-timeout test so only one git process is involved.
 const SLOW_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
@@ -258,7 +267,8 @@ fn check_json_includes_version_and_ref() {
 #[test]
 fn update_reinstalls_only_outdated_via_herdr_cli() {
     let dir = setup("update");
-    let out = run(&dir, &["update"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update"], Some(&cfg));
     // REGISTRY has 3 check errors (wave-tui, broken, evil): update installs
     // what it can and exits 2 so scripts can detect the partial check.
     assert_eq!(
@@ -288,7 +298,7 @@ fn update_respects_exclude_list() {
     let cfg = dir.join("config.toml");
     std::fs::write(
         &cfg,
-        "auto_update = true\nexclude = [\"herdr-file-viewer\"]\n",
+        "policy = \"auto\"\nauto_update = true\nexclude = [\"herdr-file-viewer\"]\n",
     )
     .unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
@@ -314,7 +324,8 @@ fn startup_honors_auto_update_disabled() {
 #[test]
 fn startup_updates_by_default() {
     let dir = setup("startup-on");
-    let out = run(&dir, &["startup"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["startup"], Some(&cfg));
     // startup delegates to update: check errors (3 in REGISTRY) -> exit 2.
     assert_eq!(out.status.code(), Some(2));
     assert!(installs(&dir).contains("smarzban/herdr-file-viewer"));
@@ -323,7 +334,8 @@ fn startup_updates_by_default() {
 #[test]
 fn update_json_reports_actions() {
     let dir = setup("update-json");
-    let out = run(&dir, &["update", "--json"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update", "--json"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // registry has check errors
     let s = stdout_of(&out);
     assert!(
@@ -380,7 +392,8 @@ fn check_pinned_compares_against_ref_not_head() {
 #[test]
 fn update_passes_ref_flag_for_pinned_plugins() {
     let dir = setup("update-pinned");
-    let out = run(&dir, &["update"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(
         out.status.code(),
         Some(2), // registry has check errors
@@ -403,7 +416,8 @@ fn update_passes_ref_flag_for_pinned_plugins() {
 #[test]
 fn update_notifies_after_updates() {
     let dir = setup("update-notify");
-    let out = run(&dir, &["update"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // registry has check errors
     let n = notifications(&dir);
     assert!(
@@ -417,7 +431,7 @@ fn update_notifies_after_updates() {
 fn update_notify_can_be_disabled() {
     let dir = setup("update-notify-off");
     let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "notify = false\n").unwrap();
+    std::fs::write(&cfg, "policy = \"auto\"\nnotify = false\n").unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // registry has check errors
     assert_eq!(notifications(&dir), "", "notify=false must not notify");
@@ -427,7 +441,11 @@ fn update_notify_can_be_disabled() {
 fn update_notify_skipped_when_nothing_to_do() {
     let dir = setup("update-notify-idle");
     let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "exclude = [\"herdr-file-viewer\"]\n").unwrap();
+    std::fs::write(
+        &cfg,
+        "policy = \"auto\"\nexclude = [\"herdr-file-viewer\"]\n",
+    )
+    .unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // registry has check errors
                                             // herdr-file-viewer excluded, pinned.old still updated -> notify fires.
@@ -441,7 +459,8 @@ fn update_notify_skipped_when_nothing_to_do() {
 #[test]
 fn update_only_restricts_install() {
     let dir = setup("update-only");
-    let out = run(&dir, &["update", "--only", "herdr-file-viewer"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update", "--only", "herdr-file-viewer"], Some(&cfg));
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -480,7 +499,8 @@ fn update_only_local_plugin_is_fatal() {
 #[test]
 fn update_json_does_not_notify() {
     let dir = setup("update-json-notify");
-    let out = run(&dir, &["update", "--json"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update", "--json"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // registry has check errors
     assert_eq!(notifications(&dir), "", "--json must not notify");
 }
@@ -619,7 +639,8 @@ fn update_concurrency_bounded_by_config() {
 #[test]
 fn plan_reports_actions_without_installing() {
     let dir = setup("plan");
-    let out = run(&dir, &["plan"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["plan"], Some(&cfg));
     // REGISTRY has check errors -> unified contract exit 2.
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
@@ -644,7 +665,8 @@ fn plan_clean_registry_exits_1_without_installing() {
 #[test]
 fn plan_json_includes_status_and_action() {
     let dir = setup("plan-json");
-    let out = run(&dir, &["plan", "--json"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["plan", "--json"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
     assert!(s.contains("\"status\": \"behind\""), "{s}");
@@ -704,7 +726,7 @@ fn policy_pinned_only_updates_only_pinned_plugins() {
 fn allow_restricts_updates_by_owner_repo() {
     let dir = setup("allow");
     let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "allow = [\"ragamo/*\"]\n").unwrap();
+    std::fs::write(&cfg, "policy = \"auto\"\nallow = [\"ragamo/*\"]\n").unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2));
     let log = installs(&dir);
@@ -721,7 +743,8 @@ fn allow_restricts_updates_by_owner_repo() {
 #[test]
 fn apply_acts_like_update() {
     let dir = setup("apply");
-    let out = run(&dir, &["apply"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["apply"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // check errors
     let log = installs(&dir);
     assert!(log.contains("smarzban/herdr-file-viewer"), "{log}");
@@ -744,7 +767,8 @@ fn diverged_is_held_by_default() {
         )
         .unwrap();
     }
-    let out = run(&dir, &["update"], None);
+    let cfg = auto_cfg(&dir, "");
+    let out = run(&dir, &["update"], Some(&cfg));
     // REGISTRY has check errors -> 2; herdr-file-viewer must NOT be installed.
     assert_eq!(out.status.code(), Some(2));
     let log = installs(&dir);
@@ -770,7 +794,7 @@ fn diverged_installs_with_allow_force_push() {
         .unwrap();
     }
     let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "allow_force_push = true\n").unwrap();
+    std::fs::write(&cfg, "policy = \"auto\"\nallow_force_push = true\n").unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(2)); // errors still present in REGISTRY
     assert!(installs(&dir).contains("smarzban/herdr-file-viewer"));
@@ -822,8 +846,7 @@ fn rollback_reinstalls_previous_commit() {
 fn update_records_state_history() {
     let dir = setup("state-record");
     write_registry(&dir, CLEAN_REGISTRY);
-    let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "").unwrap();
+    let cfg = auto_cfg(&dir, "");
     let out = run(&dir, &["update"], Some(&cfg));
     assert_eq!(out.status.code(), Some(0)); // no errors in CLEAN_REGISTRY
     let st = std::fs::read_to_string(dir.join("state.json")).unwrap_or_default();
@@ -925,7 +948,7 @@ fn trusted_owners_holds_untrusted_owners() {
     write_registry(&dir, CLEAN_REGISTRY);
     let cfg = dir.join("config.toml");
     // herdr-file-viewer is smarzban/...; only ragamo is trusted.
-    std::fs::write(&cfg, "trusted_owners = [\"ragamo\"]\n").unwrap();
+    std::fs::write(&cfg, "policy = \"auto\"\ntrusted_owners = [\"ragamo\"]\n").unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
     // CLEAN_REGISTRY has 2 updates (file-viewer, pinned.old); file-viewer held.
     let log = installs(&dir);
@@ -982,7 +1005,7 @@ fn commit_pin_is_never_updateable() {
     let dir = setup("commit-pin-immutable-off");
     write_registry(&dir, PINNED_REGISTRY);
     let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "immutable_pins = false\n").unwrap();
+    std::fs::write(&cfg, "policy = \"auto\"\nimmutable_pins = false\n").unwrap();
     let out = run(&dir, &["plan"], Some(&cfg));
     let s = stdout_of(&out);
     // commit.pinned: pin IS the commit -> same, never UPDATE even without immutable_pins.
@@ -998,17 +1021,26 @@ fn commit_pin_is_never_updateable() {
 }
 
 #[test]
-fn auto_policy_emits_migration_warning() {
+fn unset_policy_emits_migration_warning() {
     let dir = setup("migration-warning");
     let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, "").unwrap(); // policy unset -> auto
+    std::fs::write(&cfg, "").unwrap(); // policy unset -> v1.0 default notify
     let out = run(&dir, &["update"], Some(&cfg));
     let e = String::from_utf8_lossy(&out.stderr);
-    assert!(e.contains("v1.0 will default to \"notify\""), "{e}");
+    assert!(
+        e.contains("policy` is not set; defaulting to \"notify\""),
+        "{e}"
+    );
     // Explicit policy silences the warning.
     let cfg2 = dir.join("config2.toml");
     std::fs::write(&cfg2, "policy = \"notify\"\n").unwrap();
     let out2 = run(&dir, &["update"], Some(&cfg2));
     let e2 = String::from_utf8_lossy(&out2.stderr);
-    assert!(!e2.contains("v1.0 will default"), "{e2}");
+    assert!(!e2.contains("policy` is not set"), "{e2}");
+    // Explicit auto policy also silences it (opt-in).
+    let cfg3 = dir.join("config3.toml");
+    std::fs::write(&cfg3, "policy = \"auto\"\n").unwrap();
+    let out3 = run(&dir, &["update"], Some(&cfg3));
+    let e3 = String::from_utf8_lossy(&out3.stderr);
+    assert!(!e3.contains("policy` is not set"), "{e3}");
 }

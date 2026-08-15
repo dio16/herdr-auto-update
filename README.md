@@ -1,9 +1,11 @@
 # herdr-auto-update
 
 A [herdr](https://herdr.dev) plugin that checks your installed plugins for newer
-upstream commits and reinstalls them. It runs automatically at herdr server
-startup, and can also be triggered manually as a plugin action or a standalone
-CLI.
+upstream commits and reinstalls them - if you opt in. Since v1.0 the default
+`policy` is `notify`: updates are detected and reported, but never installed
+automatically. Set `policy = "auto"` (or `"pinned-only"`) in the plugin
+config to enable automatic reinstalls. Runs as a herdr plugin action and as a
+standalone CLI.
 
 herdr plugin v1 has no dedicated `plugin update` command, so this plugin
 performs the update as a reinstall (`herdr plugin install <owner>/<repo>`),
@@ -32,8 +34,10 @@ which replaces the managed checkout while preserving plugin config and state.
 - Standalone CLI with human and `--json` output and scriptable exit codes,
   including `--only <plugin_id>` to target a single plugin.
 - `exclude` list for plugins you do not want touched.
-- Update policy: `auto` (reinstall), `notify` (report only, never install),
-  `pinned-only` (update only pinned plugins), plus `allow` owner/repo globs.
+- Update policy: `auto` (reinstall), `notify` (report only, never install;
+  the default since v1.0), `pinned-only` (update only pinned plugins), plus
+  `allow` owner/repo globs. A one-line stderr note is printed while `policy`
+  is unset.
 - Dry-run `plan` command and explicit `apply`, both scriptable via `--json`.
 - Linux, macOS, and Windows support; Rust binary with argv-based subprocess
   calls (no shell interpolation).
@@ -101,13 +105,14 @@ timeout_secs = 20
 # never spawn more git processes than this.
 max_concurrency = 8
 
-# Update policy (default "auto"): what update/apply/startup may do with a
-# plugin whose upstream ref changed.
-#   "auto"        - reinstall outdated plugins (current behavior)
+# Update policy (default "notify" since v1.0): what update/apply/startup may
+# do with a plugin whose upstream ref changed.
+#   "auto"        - reinstall outdated plugins automatically
 #   "notify"      - check, report, and notify only; never install
 #   "pinned-only" - reinstall only plugins installed with a pinned --ref
-# NOTE: the default will change from "auto" to "notify" in v1.0; the binary
-# prints a stderr note while policy stays unset.
+# v0.x users: an unset policy now defaults to "notify" (no automatic
+# reinstalls) and prints a one-line stderr note. Set `policy = "auto"` below
+# to keep the v0.x automatic-update behavior.
 policy = "auto"
 
 # Restrict update targets to owner/repo glob patterns (default: all GitHub

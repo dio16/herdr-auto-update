@@ -9,8 +9,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Policy {
-    /// Install updates, honoring `allow` / `exclude` (default; v0.2 keeps
-    /// v0.1 behavior for compatibility).
+    /// Install updates, honoring `allow` / `exclude`. Explicit opt-in since
+    /// v1.0 (the default is now `Notify`).
     Auto,
     /// Check, report, and notify only; never install.
     Notify,
@@ -35,7 +35,7 @@ pub struct Config {
     /// Upper bound on concurrent remote checks. Bounded so a registry full of
     /// plugins cannot spawn an unbounded number of git processes.
     pub max_concurrency: usize,
-    /// Update policy: auto (default) | notify | pinned-only.
+    /// Update policy: notify (default since v1.0) | auto | pinned-only.
     pub policy: Policy,
     /// Restrict update targets to these `owner/repo` glob patterns
     /// (e.g. `["ragamo/*", "*/herdr-file-viewer"]`). Empty = all GitHub
@@ -60,6 +60,11 @@ pub struct Config {
     /// Parents state.json / compare-cache.json resolution.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
+    /// Whether the config file set `policy` explicitly. Since v1.0 an unset
+    /// `policy` defaults to `Notify`; this flag lets update/startup warn
+    /// users migrating from the v0.x `Auto` default.
+    #[serde(skip)]
+    pub policy_explicit: bool,
 }
 
 impl Default for Config {
@@ -70,13 +75,14 @@ impl Default for Config {
             exclude: Vec::new(),
             timeout_secs: 20,
             max_concurrency: 8,
-            policy: Policy::Auto,
+            policy: Policy::Notify,
             allow: Vec::new(),
             require_fast_forward: true,
             allow_force_push: false,
             trusted_owners: Vec::new(),
             immutable_pins: true,
             config_path: None,
+            policy_explicit: false,
         }
     }
 }
@@ -141,7 +147,19 @@ pub fn load(override_path: Option<&str>) -> Result<Config, String> {
     };
     let mut cfg: Config =
         toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+    // v1.0: an unset `policy` defaults to Notify. Detect an explicit key so
+    // update/startup can warn users migrating from the v0.x `auto` default
+    // (warn only when a config file actually exists - fresh installs stay
+    // silent, they have nothing to migrate).
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Probe {
+        policy: Option<Policy>,
+    }
+    let probe: Probe =
+        toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", path.display()))?;
     cfg.config_path = Some(path);
+    cfg.policy_explicit = probe.policy.is_some();
     Ok(cfg)
 }
 
@@ -205,7 +223,8 @@ mod tests {
         assert!(cfg.exclude.is_empty());
         assert_eq!(cfg.timeout_secs, 20);
         assert_eq!(cfg.max_concurrency, 8);
-        assert_eq!(cfg.policy, Policy::Auto);
+        assert_eq!(cfg.policy, Policy::Notify);
+        assert!(!cfg.policy_explicit);
         assert!(cfg.allow.is_empty());
         assert!(cfg.require_fast_forward);
         assert!(!cfg.allow_force_push);
@@ -230,10 +249,25 @@ mod tests {
         assert_eq!(cfg.timeout_secs, 5);
         assert_eq!(cfg.max_concurrency, 2);
         assert_eq!(cfg.policy, Policy::PinnedOnly);
+        assert!(cfg.policy_explicit, "policy key present -> explicit");
+        assert_eq!(cfg.allow, vec!["ragamo/*"]);
         assert!(cfg.is_allowed("ragamo", "herdr-flock"));
         assert!(!cfg.is_allowed("dio16", "herdr-flock"));
         assert!(!cfg.require_fast_forward);
         assert!(cfg.allow_force_push);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_without_policy_key_defaults_notify_but_tracks_path() {
+        let dir = std::env::temp_dir().join(format!("hau-cfg-nopol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "auto_update = false\n").unwrap();
+        let cfg = load(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(cfg.policy, Policy::Notify);
+        assert!(!cfg.policy_explicit, "no policy key -> not explicit");
+        assert_eq!(cfg.config_path.as_deref(), Some(path.as_path()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

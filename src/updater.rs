@@ -214,10 +214,10 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     };
     let plan = build_plan(cfg, &statuses);
 
-    if !json && cfg.policy == Policy::Auto {
+    if !json && cfg.policy == Policy::Notify && !cfg.policy_explicit {
         eprintln!(
-            "[herdr-auto-update] note: policy=\"auto\" is the current default; v1.0 will default \
-             to \"notify\". Set policy explicitly to keep behavior stable."
+            "[herdr-auto-update] note: `policy` is not set; defaulting to \"notify\" (v1.0). \
+             Set policy = \"auto\" to reinstall updates automatically."
         );
     }
 
