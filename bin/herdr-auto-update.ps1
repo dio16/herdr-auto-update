@@ -1,0 +1,78 @@
+# herdr-auto-update launcher shim (Windows).
+#
+# Same contract as bin/herdr-auto-update (POSIX): resolve the binary from a
+# local release build, a cached download, or a fresh download verified against
+# the published SHA256 checksum, then run it with all arguments forwarded.
+
+$ErrorActionPreference = "Stop"
+
+$DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
+$PLUGIN_ROOT = Split-Path -Parent $DIR
+
+# 1. Local release build (dev path).
+$dev = Join-Path $PLUGIN_ROOT "target\release\herdr-auto-update.exe"
+if (Test-Path $dev) {
+    & $dev @args
+    exit $LASTEXITCODE
+}
+
+# Version and target triple are baked into the asset name; keep in sync with
+# .github/workflows/release.yml.
+$manifest = Join-Path $PLUGIN_ROOT "herdr-plugin.toml"
+$VERSION = (Select-String -Path $manifest -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+
+$os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+$TRIPLE = if ($os -like "*Windows*") {
+    "x86_64-pc-windows-msvc"
+} elseif ($os -like "*Darwin*") {
+    if ($arch -eq "Arm64") { "aarch64-apple-darwin" } else { "x86_64-apple-darwin" }
+} else {
+    if ($arch -eq "Arm64") { "aarch64-unknown-linux-gnu" } else { "x86_64-unknown-linux-gnu" }
+}
+
+$ASSET = "herdr-auto-update-$VERSION-$TRIPLE.tar.gz"
+$REPO = "dio16/herdr-auto-update"
+
+$CACHE_DIR = Join-Path $DIR ".cache"
+$CACHED_BIN = Join-Path $CACHE_DIR "herdr-auto-update-$VERSION-$TRIPLE.exe"
+
+# 2. Cached download from a previous run.
+if (Test-Path $CACHED_BIN) {
+    & $CACHED_BIN @args
+    exit $LASTEXITCODE
+}
+
+# 3. Fresh download + SHA256 verification.
+$TMP = Join-Path $env:TEMP ("hau-" + [guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $TMP | Out-Null
+
+try {
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        gh release download "v$VERSION" --repo $REPO --pattern $ASSET --pattern "checksums-$VERSION.txt" --dir $TMP
+    } else {
+        $base = "https://github.com/$REPO/releases/download/v$VERSION"
+        Invoke-WebRequest -Uri "$base/$ASSET" -OutFile (Join-Path $TMP $ASSET)
+        Invoke-WebRequest -Uri "$base/checksums-$VERSION.txt" -OutFile (Join-Path $TMP "checksums-$VERSION.txt")
+    }
+
+    $tarball = Join-Path $TMP $ASSET
+    $expected = (Get-Content (Join-Path $TMP "checksums-$VERSION.txt") | Where-Object { $_ -match "\s$ASSET$" } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
+    $actual = (Get-FileHash $tarball -Algorithm SHA256).Hash.ToLower()
+    if (-not $expected -or $expected -ne $actual) {
+        Write-Error "herdr-auto-update: checksum mismatch for $ASSET (expected $expected, got $actual)"
+    }
+
+    tar -xzf $tarball -C $TMP
+    if (-not (Test-Path (Join-Path $TMP "herdr-auto-update.exe"))) {
+        Write-Error "herdr-auto-update: $ASSET did not unpack to the expected 'herdr-auto-update.exe' binary."
+    }
+
+    New-Item -ItemType Directory -Path $CACHE_DIR -Force | Out-Null
+    Move-Item (Join-Path $TMP "herdr-auto-update.exe") $CACHED_BIN
+    Write-Host "herdr-auto-update: installed prebuilt binary $VERSION ($TRIPLE); launching."
+    & $CACHED_BIN @args
+    exit $LASTEXITCODE
+} finally {
+    Remove-Item -Recurse -Force $TMP -ErrorAction SilentlyContinue
+}

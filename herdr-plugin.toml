@@ -1,22 +1,23 @@
 id = "herdr-auto-update"
 name = "herdr-auto-update"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.0"
 description = "Check installed herdr plugins for newer upstream commits and reinstall them; optionally runs automatically at herdr startup"
 platforms = ["linux", "macos", "windows"]
 
-# Build step run by `herdr plugin install`. Requires a Rust toolchain.
-[[build]]
-command = ["cargo", "build", "--release"]
+# No [[build]] step: install is clone-only so a Rust toolchain is NOT required.
+# Every command goes through the bin/ launcher shim, which downloads the
+# versioned prebuilt binary from GitHub Releases on first run and verifies its
+# SHA256 checksum (see .github/workflows/release.yml).
 
 # Auto check + reinstall at herdr server startup (respects config auto_update).
 [[startup]]
 platforms = ["linux", "macos"]
-command = ["sh", "scripts/run.sh", "startup"]
+command = ["sh", "bin/herdr-auto-update", "startup"]
 
 [[startup]]
 platforms = ["windows"]
-command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run.ps1", "startup"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-auto-update.ps1", "startup"]
 
 # Manual actions. Action ids must be unique inside the plugin (herdr rejects
 # duplicates regardless of platform), so only the Windows entries get a
@@ -26,25 +27,25 @@ id = "check"
 title = "Check herdr plugin updates"
 contexts = ["workspace"]
 platforms = ["linux", "macos"]
-command = ["sh", "scripts/run.sh", "check"]
+command = ["sh", "bin/herdr-auto-update", "check"]
 
 [[actions]]
 id = "check-windows"
 title = "Check herdr plugin updates"
 contexts = ["workspace"]
 platforms = ["windows"]
-command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run.ps1", "check"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-auto-update.ps1", "check"]
 
 [[actions]]
 id = "update"
 title = "Update herdr plugins"
 contexts = ["workspace"]
 platforms = ["linux", "macos"]
-command = ["sh", "scripts/run.sh", "update"]
+command = ["sh", "bin/herdr-auto-update", "update"]
 
 [[actions]]
 id = "update-windows"
 title = "Update herdr plugins"
 contexts = ["workspace"]
 platforms = ["windows"]
-command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run.ps1", "update"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "bin/herdr-auto-update.ps1", "update"]

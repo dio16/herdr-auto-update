@@ -37,6 +37,30 @@ pub enum Status {
     Unknown,
 }
 
+/// What kind of ref a plugin is pinned to (`--ref` at install time).
+/// Unpinned plugins track the default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RefKind {
+    /// Tracks a branch (explicit `--ref` or unpinned = default branch).
+    Branch,
+    /// Pinned to a tag (mutable-ish: a tag can be force-moved upstream).
+    Tag,
+    /// Pinned to an exact commit SHA - immutable by construction.
+    Commit,
+}
+
+/// Classify a `requested_ref` into a channel kind. A 40-hex ref is a commit;
+/// `refs/tags/*` is a tag; everything else (incl. `refs/heads/*` and `None`)
+/// is a branch.
+pub fn ref_kind(requested_ref: Option<&str>) -> RefKind {
+    match requested_ref {
+        Some(r) if r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit()) => RefKind::Commit,
+        Some(r) if r.starts_with("refs/tags/") => RefKind::Tag,
+        _ => RefKind::Branch,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginStatus {
     pub plugin_id: String,
@@ -48,6 +72,7 @@ pub struct PluginStatus {
     pub remote_sha: Option<String>,
     pub update_available: bool,
     pub status: Status,
+    pub ref_kind: RefKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +101,7 @@ pub struct PlanEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_sha: Option<String>,
     pub status: Status,
+    pub ref_kind: RefKind,
     pub policy: crate::config::Policy,
     pub action: Action,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +182,7 @@ pub fn run_plan(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 println!("  remote: {}", short(r));
             }
             println!("  status: {}", status_label(e.status));
+            println!("  channel: {}", ref_kind_label(e.ref_kind));
             println!("  policy: {}", policy_label(e.policy));
             println!("  action: {}", action_label(e.action));
             if let Some(r) = &e.reason {
@@ -310,6 +337,7 @@ fn build_plan(cfg: &Config, statuses: &[PluginStatus]) -> Vec<PlanEntry> {
                 installed_sha: s.installed_sha.clone(),
                 remote_sha: s.remote_sha.clone(),
                 status: s.status,
+                ref_kind: s.ref_kind,
                 policy: cfg.policy,
                 action,
                 requested_ref: s.requested_ref.clone(),
@@ -628,6 +656,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 remote_sha: None,
                 update_available: false,
                 status: Status::Unknown,
+                ref_kind: ref_kind(src.requested_ref.as_deref()),
                 requested_ref: src.requested_ref.clone(),
                 error: Some("github source missing owner/repo/commit fields".to_string()),
             }));
@@ -643,8 +672,28 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 remote_sha: None,
                 update_available: false,
                 status: Status::Unknown,
+                ref_kind: ref_kind(src.requested_ref.as_deref()),
                 requested_ref: src.requested_ref.clone(),
                 error: Some("invalid owner/repo recorded in registry".to_string()),
+            }));
+            continue;
+        }
+        // A commit-pinned plugin is immutable by construction: the pin IS the
+        // installed commit, so it can never be behind upstream and is never
+        // updated. Skip the network entirely (v0.4 ref channels).
+        if ref_kind(src.requested_ref.as_deref()) == RefKind::Commit {
+            statuses.push(Some(PluginStatus {
+                plugin_id: p.plugin_id.clone(),
+                owner: owner.clone(),
+                repo: repo.clone(),
+                version: p.version.clone(),
+                installed_sha: rc.clone(),
+                remote_sha: Some(rc.clone()),
+                update_available: false,
+                status: Status::Same,
+                ref_kind: RefKind::Commit,
+                requested_ref: src.requested_ref.clone(),
+                error: None,
             }));
             continue;
         }
@@ -712,6 +761,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 remote_sha: result.remote_sha,
                 update_available: result.status == Status::Behind,
                 status: result.status,
+                ref_kind: ref_kind(job.requested_ref.as_deref()),
                 requested_ref: job.requested_ref.clone(),
                 error: result.error,
             };
@@ -988,6 +1038,14 @@ fn status_label(s: Status) -> &'static str {
         Status::Ahead => "ahead",
         Status::Diverged => "diverged",
         Status::Unknown => "unknown",
+    }
+}
+
+fn ref_kind_label(k: RefKind) -> &'static str {
+    match k {
+        RefKind::Branch => "branch",
+        RefKind::Tag => "tag",
+        RefKind::Commit => "commit",
     }
 }
 

@@ -848,3 +848,56 @@ fn history_prints_recorded_updates() {
     let s = stdout_of(&out);
     assert!(s.contains("updated herdr-file-viewer"), "{s}");
 }
+
+/// Registry with a tag-pinned and a commit-pinned plugin, no error entries.
+const PINNED_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
+  {"plugin_id":"tag.pinned","version":"1.0.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"2222222222222222222222222222222222222222","requested_ref":"refs/tags/v1.0.0"}},
+  {"plugin_id":"commit.pinned","version":"1.0.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"3333333333333333333333333333333333333333","requested_ref":"3333333333333333333333333333333333333333"}},
+  {"plugin_id":"flock.farm","version":"0.1.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3"}}
+]}}"#;
+
+/// v0.4: the pin channel (branch / tag / commit) is surfaced per plugin.
+#[test]
+fn plan_reports_ref_channel() {
+    let dir = setup("plan-channel");
+    write_registry(&dir, PINNED_REGISTRY);
+    let out = run(&dir, &["plan"], None);
+    assert_eq!(out.status.code(), Some(1)); // updates available, no errors
+    let s = stdout_of(&out);
+    let block: Vec<&str> = s.lines().collect();
+    for (name, want) in [
+        ("tag.pinned", "channel: tag"),
+        ("commit.pinned", "channel: commit"),
+        ("flock.farm", "channel: branch"),
+    ] {
+        let idx = block
+            .iter()
+            .position(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} missing: {s}"));
+        assert!(
+            block[idx..].iter().take(6).any(|l| l.contains(want)),
+            "{name} should show '{want}': {s}"
+        );
+    }
+}
+
+/// v0.4: a commit pin IS the installed commit - never a network check, never
+/// an update candidate.
+#[test]
+fn commit_pin_skips_network_and_never_updates() {
+    let dir = setup("commit-pin");
+    write_registry(&dir, PINNED_REGISTRY);
+    // The logging stub records every git invocation so the test can assert
+    // the commit-pinned plugin never reaches the network.
+    std::fs::write(dir.join("stub-git.sh"), STUB_GIT_POOL_SH).unwrap();
+    let out = run(&dir, &["check"], None);
+    assert_eq!(out.status.code(), Some(1)); // tag.pinned is behind
+    let log = std::fs::read_to_string(dir.join("git-runs.log")).unwrap_or_default();
+    let calls: Vec<&str> = log.lines().filter(|l| *l == "start").collect();
+    // tag.pinned (tag, resolvable) and flock.farm (branch) hit git;
+    // commit.pinned never does.
+    assert_eq!(calls.len(), 2, "commit.pinned must not hit git: {log}");
+    let s = stdout_of(&out);
+    assert!(s.contains("commit.pinned"), "{s}");
+    assert!(s.contains("up to date"), "{s}");
+}

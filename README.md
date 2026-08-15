@@ -11,10 +11,14 @@ which replaces the managed checkout while preserving plugin config and state.
 
 ## Features
 
-- Checks every GitHub-installed plugin against its upstream `HEAD` (via
+- Checks every GitHub-installed plugin against its upstream ref (via
   `git ls-remote`) and reinstalls the outdated ones. Plugins installed with
   `herdr plugin install --ref` keep their pin: they are compared and
   reinstalled against that same ref, never moved to `HEAD`.
+- Ref channels are explicit: branch / tag / commit pins are classified
+  (`channel:` in `plan` output, `ref_kind` in JSON). Commit-pinned plugins
+  are immutable by construction - the pin is the installed commit, so they
+  are never reinstalled and never hit the network.
 - Remote checks run in parallel under a bounded worker pool
   (`max_concurrency`, default 8), so the check time is one network round trip
   regardless of how many plugins are installed.
@@ -41,14 +45,19 @@ which replaces the managed checkout while preserving plugin config and state.
   requires it)
 - `curl` on PATH (used to classify update direction via the GitHub compare
   API; when unavailable every changed plugin is reported as `unknown`)
-- A Rust toolchain on the machine that installs the plugin (the plugin builds
-  itself with `cargo build --release` during `herdr plugin install`)
+- `gh` CLI or `curl` for the launcher's first-run binary download (Linux and
+  macOS also need `tar`; Windows 10+ ships `tar` and `curl`)
 
 ## Install
 
 ```bash
 herdr plugin install dio16/herdr-auto-update
 ```
+
+No Rust toolchain is required: the manifest has no build step (clone-only
+install), and the `bin/` launcher downloads the versioned prebuilt binary for
+your platform from GitHub Releases on first use, verifying its SHA256
+checksum before running it. The binary is cached in `bin/.cache/`.
 
 Enable the actions you want in `~/.config/herdr/config.toml`
 (or `%APPDATA%\herdr\config.toml` on Windows):
@@ -134,7 +143,8 @@ herdr-auto-update check
 `herdr-auto-update check --json` — same check, machine-readable output as a
 JSON array of plugin statuses (one object per plugin with `plugin_id`, `owner`,
 `repo`, `version`, `installed_sha`, `remote_sha`, `update_available`, `status`
-(`same`/`behind`/`ahead`/`diverged`/`unknown`), `requested_ref`, `error`).
+(`same`/`behind`/`ahead`/`diverged`/`unknown`), `ref_kind`
+(`branch`/`tag`/`commit`), `requested_ref`, `error`).
 
 `status` is classified via the GitHub compare API (`installed...upstream`):
 `behind` = upstream has commits you lack (updateable), `ahead` = you have
@@ -249,6 +259,14 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
+With a local `target/release/herdr-auto-update` present, the `bin/` launcher
+runs that build directly (no download); without it, the launcher downloads the
+versioned prebuilt binary for your platform from GitHub Releases, verifying
+its SHA256 checksum (release assets: `herdr-auto-update-<version>-<triple>.tar.gz`
++ `checksums-<version>.txt`, built by `.github/workflows/release.yml` on tag
+pushes). The dev launchers `scripts/run.sh` / `scripts/run.ps1` remain for
+cargo-built installs.
+
 To be listed in the herdr marketplace, add the `herdr-plugin` topic to the
 repository on GitHub (the index refreshes automatically).
 
@@ -261,6 +279,12 @@ repository on GitHub (the index refreshes automatically).
   herdr's own installer. The only files it writes are `state.json` and
   `compare-cache.json` in herdr's plugin config directory (needed for
   rollback and rate-limit-safe classification).
+- Prebuilt binaries are downloaded from the `dio16/herdr-auto-update`
+  GitHub release matching the pinned version and verified against the
+  release's SHA256 checksum before execution. The binary is cached under
+  `bin/.cache/` (gitignored). The `bin/` launcher falls back to a local
+  `cargo build --release` when present, so `herdr plugin link` dev setups
+  never download anything.
 - Dependencies are minimal (`serde`, `serde_json`, `toml`), pinned by
   `Cargo.lock` for the binary.
 

@@ -1,0 +1,80 @@
+#!/bin/sh
+# herdr-auto-update launcher shim (POSIX: Linux/macOS).
+#
+# herdr runs this script (relative to the plugin root) for every action. It
+# resolves an executable herdr-auto-update binary and execs it with all
+# arguments forwarded, trying in order:
+#
+#   1. A local release build (target/release/herdr-auto-update) - dev path.
+#   2. A cached prebuilt binary downloaded on a previous run.
+#   3. A fresh download of the versioned prebuilt binary from GitHub Releases,
+#      verified against the published SHA256 checksum before use.
+#
+# This is what makes `herdr plugin install` work without a Rust toolchain:
+# the manifest has no [[build]] step (see herdr-plugin.toml).
+
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PLUGIN_ROOT=$(CDPATH= cd -- "$DIR/.." && pwd)
+
+# 1. Local release build (dev path).
+if [ -x "$PLUGIN_ROOT/target/release/herdr-auto-update" ]; then
+    exec "$PLUGIN_ROOT/target/release/herdr-auto-update" "$@"
+fi
+
+# Version and target triple are baked into the asset name; keep in sync with
+# .github/workflows/release.yml.
+VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PLUGIN_ROOT/herdr-plugin.toml" | head -1)
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)  TRIPLE="x86_64-unknown-linux-gnu" ;;
+    Linux-aarch64) TRIPLE="aarch64-unknown-linux-gnu" ;;
+    Darwin-x86_64) TRIPLE="x86_64-apple-darwin" ;;
+    Darwin-arm64)  TRIPLE="aarch64-apple-darwin" ;;
+    *) echo "herdr-auto-update: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+ASSET="herdr-auto-update-$VERSION-$TRIPLE.tar.gz"
+REPO="dio16/herdr-auto-update"
+
+CACHE_DIR="$DIR/.cache"
+CACHED_BIN="$CACHE_DIR/herdr-auto-update-$VERSION-$TRIPLE"
+
+# 2. Cached download from a previous run.
+if [ -x "$CACHED_BIN" ]; then
+    exec "$CACHED_BIN" "$@"
+fi
+
+# 3. Fresh download + SHA256 verification.
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+if command -v gh >/dev/null 2>&1; then
+    gh release download "v$VERSION" \
+        --repo "$REPO" \
+        --pattern "$ASSET" \
+        --pattern "checksums-$VERSION.txt" \
+        --dir "$TMP"
+else
+    BASE="https://github.com/$REPO/releases/download/v$VERSION"
+    curl -fsSL -o "$TMP/$ASSET" "$BASE/$ASSET"
+    curl -fsSL -o "$TMP/checksums-$VERSION.txt" "$BASE/checksums-$VERSION.txt"
+fi
+
+expected=$(awk -v a="$ASSET" '$2 == a { print $1; exit }' "$TMP/checksums-$VERSION.txt")
+actual=$(sha256sum "$TMP/$ASSET" | awk '{ print $1 }')
+if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "herdr-auto-update: checksum mismatch for $ASSET (expected $expected, got $actual)" >&2
+    exit 1
+fi
+
+if ! tar -xzf "$TMP/$ASSET" -C "$TMP" || [ ! -f "$TMP/herdr-auto-update" ]; then
+    echo "herdr-auto-update: $ASSET did not unpack to the expected 'herdr-auto-update' binary." >&2
+    exit 1
+fi
+
+mkdir -p "$CACHE_DIR"
+mv "$TMP/herdr-auto-update" "$CACHED_BIN"
+chmod +x "$CACHED_BIN"
+
+echo "herdr-auto-update: installed prebuilt binary $VERSION ($TRIPLE); launching." >&2
+exec "$CACHED_BIN" "$@"

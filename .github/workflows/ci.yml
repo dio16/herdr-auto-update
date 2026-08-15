@@ -36,4 +36,4 @@ jobs:
         run: cargo build --release
       - name: Launcher smoke test (unix)
         if: runner.os != 'Windows'
-        run: sh scripts/run.sh --version
+        run: sh bin/herdr-auto-update --version

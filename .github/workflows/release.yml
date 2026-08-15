@@ -1,0 +1,75 @@
+name: Release
+
+# Publishes prebuilt binaries so users can install without a Rust toolchain.
+# Triggered by pushing a version tag, e.g. `git tag v0.4.0 && git push --tags`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+# Canonical release asset naming - MUST stay in sync with the
+# bin/herdr-auto-update shim, which reconstructs these names to download and
+# verify the right binary:
+#     herdr-auto-update-<version>-<target-triple>.tar.gz
+# plus checksums.txt (one `sha256  asset-name` line per asset). Every asset
+# is a single-executable tarball, so extraction is safe.
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag/version consistency
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          plugin_ver=$(grep -m1 '^version' herdr-plugin.toml | sed 's/.*= *"\(.*\)"/\1/')
+          test "$tag" = "$cargo_ver" || { echo "tag v$tag != Cargo.toml $cargo_ver"; exit 1; }
+          test "$tag" = "$plugin_ver" || { echo "tag v$tag != herdr-plugin.toml $plugin_ver"; exit 1; }
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF#refs/tags/v}"
+          triple="${{ matrix.target }}"
+          exe="target/${{ matrix.target }}/release/herdr-auto-update"
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="$exe.exe"; fi
+          tmp="$(mktemp -d)"
+          cp "$exe" "$tmp/herdr-auto-update$([ "${{ runner.os }}" = "Windows" ] && echo .exe || true)"
+          tar -C "$tmp" -czf "herdr-auto-update-$ver-$triple.tar.gz" \
+            "herdr-auto-update$([ "${{ runner.os }}" = "Windows" ] && echo .exe || true)"
+          sha256sum "herdr-auto-update-$ver-$triple.tar.gz" \
+            >> "checksums-${GITHUB_REF#refs/tags/v}.txt"
+      - name: Upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            herdr-auto-update-*.tar.gz
+            checksums-*.txt
