@@ -889,7 +889,20 @@ fn commit_pin_skips_network_and_never_updates() {
     write_registry(&dir, PINNED_REGISTRY);
     // The logging stub records every git invocation so the test can assert
     // the commit-pinned plugin never reaches the network.
-    std::fs::write(dir.join("stub-git.sh"), STUB_GIT_POOL_SH).unwrap();
+    if cfg!(windows) {
+        std::fs::write(dir.join("stub-git.cmd"), STUB_GIT_POOL_CMD).unwrap();
+    } else {
+        std::fs::write(dir.join("stub-git.sh"), STUB_GIT_POOL_SH).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("stub-git.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
     let out = run(&dir, &["check"], None);
     assert_eq!(out.status.code(), Some(1)); // tag.pinned is behind
     let log = std::fs::read_to_string(dir.join("git-runs.log")).unwrap_or_default();
