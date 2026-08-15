@@ -551,6 +551,7 @@ for a in "$@"; do
     refs/*) ref="$a" ;;
   esac
 done
+echo "git ${url:-<none>}" >> "$log"
 case "$url" in
   *herdr-flock*)
     if [ -n "$ref" ]; then
@@ -568,6 +569,7 @@ const STUB_GIT_POOL_CMD: &str = "@echo off\r\n\
 echo start>> \"%~dp0git-runs.log\"\r\n\
 ping -n 2 127.0.0.1 >nul\r\n\
 echo end>> \"%~dp0git-runs.log\"\r\n\
+echo git %*>> \"%~dp0git-runs.log\"\r\n\
 set \"has_ref=no\"\r\n\
 for %%a in (%*) do (\r\n\
   echo %%a | findstr /c:\"refs/\" >nul\r\n\
@@ -903,13 +905,15 @@ fn commit_pin_skips_network_and_never_updates() {
             .unwrap();
         }
     }
-    let out = run(&dir, &["check"], None);
-    assert_eq!(out.status.code(), Some(1)); // tag.pinned is behind
+    // Isolate the commit-pinned plugin: a check restricted to it must not
+    // spawn a single git process (the pin IS the installed commit). Counting
+    // absolute runs on the full registry is brittle under parallel test
+    // runners, so the isolation proof is scoped with --only.
+    let out = run(&dir, &["check", "--only", "commit.pinned"], None);
+    assert_eq!(out.status.code(), Some(0)); // no changes, no errors
     let log = std::fs::read_to_string(dir.join("git-runs.log")).unwrap_or_default();
     let calls: Vec<&str> = log.lines().filter(|l| *l == "start").collect();
-    // tag.pinned (tag, resolvable) and flock.farm (branch) hit git;
-    // commit.pinned never does.
-    assert_eq!(calls.len(), 2, "commit.pinned must not hit git: {log}");
+    assert_eq!(calls.len(), 0, "commit.pinned must not hit git: {log}");
     let s = stdout_of(&out);
     assert!(s.contains("commit.pinned"), "{s}");
     assert!(s.contains("up to date"), "{s}");
