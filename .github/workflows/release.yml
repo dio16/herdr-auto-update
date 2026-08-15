@@ -14,8 +14,8 @@ permissions:
 # bin/herdr-auto-update shim, which reconstructs these names to download and
 # verify the right binary:
 #     herdr-auto-update-<version>-<target-triple>.tar.gz
-# plus checksums.txt (one `sha256  asset-name` line per asset). Every asset
-# is a single-executable tarball, so extraction is safe.
+# plus a single checksums.txt (one `sha256  asset-name` line per asset).
+# Every asset is a single-executable tarball, so extraction is safe.
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -43,6 +43,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            linker: aarch64-linux-gnu-gcc
+            cross_deps: gcc-aarch64-linux-gnu
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
@@ -51,7 +53,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install cross-linker
+        if: matrix.cross_deps != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_deps }}
       - name: Build release binary
+        env:
+          # Host `cc`/rust-lld is x86-64 and cannot link aarch64 objects;
+          # use the cross gcc for aarch64-unknown-linux-gnu.
+          RUSTFLAGS: ${{ matrix.linker != '' && format('-C linker={0}', matrix.linker) || '' }}
         run: cargo build --release --target ${{ matrix.target }}
       - name: Stage asset
         shell: bash
@@ -65,11 +76,35 @@ jobs:
           cp "$exe" "$tmp/herdr-auto-update$([ "${{ runner.os }}" = "Windows" ] && echo .exe || true)"
           tar -C "$tmp" -czf "herdr-auto-update-$ver-$triple.tar.gz" \
             "herdr-auto-update$([ "${{ runner.os }}" = "Windows" ] && echo .exe || true)"
-          sha256sum "herdr-auto-update-$ver-$triple.tar.gz" \
-            >> "checksums-${GITHUB_REF#refs/tags/v}.txt"
-      - name: Upload assets
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.target }}
+          path: herdr-auto-update-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: asset-*
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF#refs/tags/v}"
+          cd assets
+          count=$(ls -1 herdr-auto-update-*.tar.gz | wc -l)
+          test "$count" -eq 5 || { echo "expected 5 tarballs, got $count"; exit 1; }
+          sha256sum herdr-auto-update-*.tar.gz | sed 's/  /\t/' > "checksums-$ver.txt"
+          cat "checksums-$ver.txt"
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            herdr-auto-update-*.tar.gz
-            checksums-*.txt
+            assets/herdr-auto-update-*.tar.gz
+            assets/checksums-*.txt
+          overwrite: true
