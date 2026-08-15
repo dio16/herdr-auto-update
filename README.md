@@ -28,6 +28,9 @@ which replaces the managed checkout while preserving plugin config and state.
 - Standalone CLI with human and `--json` output and scriptable exit codes,
   including `--only <plugin_id>` to target a single plugin.
 - `exclude` list for plugins you do not want touched.
+- Update policy: `auto` (reinstall), `notify` (report only, never install),
+  `pinned-only` (update only pinned plugins), plus `allow` owner/repo globs.
+- Dry-run `plan` command and explicit `apply`, both scriptable via `--json`.
 - Linux, macOS, and Windows support; Rust binary with argv-based subprocess
   calls (no shell interpolation).
 
@@ -86,6 +89,17 @@ timeout_secs = 20
 # Upper bound on concurrent upstream checks (default 8). Registry-wide runs
 # never spawn more git processes than this.
 max_concurrency = 8
+
+# Update policy (default "auto"): what update/apply/startup may do with a
+# plugin whose upstream ref changed.
+#   "auto"        - reinstall outdated plugins (current behavior)
+#   "notify"      - check, report, and notify only; never install
+#   "pinned-only" - reinstall only plugins installed with a pinned --ref
+policy = "auto"
+
+# Restrict update targets to owner/repo glob patterns (default: all GitHub
+# plugins). `*` matches any sequence (including `/`), `?` one non-`/` char.
+# allow = ["ragamo/*", "dio16/herdr-*"]
 ```
 
 ## CLI
@@ -108,8 +122,8 @@ herdr-auto-update check
 
 `herdr-auto-update check --json` — same check, machine-readable output as a
 JSON array of plugin statuses (one object per plugin with `plugin_id`, `owner`,
-`repo`, `version`, `installed_sha`, `remote_sha`, `update_available`,
-`requested_ref`, `error`).
+`repo`, `version`, `installed_sha`, `remote_sha`, `update_available`, `status`
+(`same`/`changed`/`unknown`), `requested_ref`, `error`).
 
 ```bash
 herdr-auto-update check --json
@@ -126,6 +140,27 @@ that case). Shows a notification when updates ran (unless `notify = false`).
 herdr-auto-update update
 ```
 
+### Plan (dry run)
+
+`herdr-auto-update plan` — analyze only, execute nothing: prints the status,
+policy, and action (`UPDATE`/`HOLD`/`ERROR`) for every plugin. `plan --json`
+emits the same as machine-readable JSON. Exits `1` when updates would apply,
+`2` when any plugin check errored, `0` otherwise.
+
+```bash
+herdr-auto-update plan
+herdr-auto-update plan --json
+```
+
+### Apply
+
+`herdr-auto-update apply` — execute the plan's `UPDATE` actions only (identity
+with `update`; both exist so scripts can name the phase they mean).
+
+```bash
+herdr-auto-update apply
+```
+
 ### Update one plugin
 
 `herdr-auto-update update --only <plugin_id>` — restrict check/update to a
@@ -139,8 +174,8 @@ herdr-auto-update update --only flock.farm
 ### Startup hook
 
 `herdr-auto-update startup` — what herdr runs at server startup: check and
-reinstall outdated plugins, unless `auto_update = false` in the config. Not
-meant to be run by hand.
+reinstall outdated plugins per the configured `policy`, unless
+`auto_update = false` in the config. Not meant to be run by hand.
 
 ```bash
 herdr-auto-update startup

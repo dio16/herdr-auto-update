@@ -588,3 +588,117 @@ fn update_concurrency_bounded_by_config() {
     }
     assert_eq!(out.status.code(), Some(2)); // REGISTRY still has check errors
 }
+
+#[test]
+fn plan_reports_actions_without_installing() {
+    let dir = setup("plan");
+    let out = run(&dir, &["plan"], None);
+    // REGISTRY has check errors -> unified contract exit 2.
+    assert_eq!(out.status.code(), Some(2));
+    let s = stdout_of(&out);
+    assert!(s.contains("herdr-file-viewer"), "{s}");
+    assert!(s.contains("action: UPDATE"), "{s}");
+    assert!(s.contains("action: HOLD"), "{s}");
+    assert!(s.contains("status: changed"), "{s}");
+    // Plan never installs.
+    assert_eq!(installs(&dir), "", "plan must not reinstall anything");
+}
+
+#[test]
+fn plan_clean_registry_exits_1_without_installing() {
+    let dir = setup("plan-clean");
+    write_registry(&dir, CLEAN_REGISTRY);
+    let out = run(&dir, &["plan"], None);
+    // Updates pending, no errors -> 1.
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(installs(&dir), "", "plan must not reinstall anything");
+}
+
+#[test]
+fn plan_json_includes_status_and_action() {
+    let dir = setup("plan-json");
+    let out = run(&dir, &["plan", "--json"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let s = stdout_of(&out);
+    assert!(s.contains("\"status\": \"changed\""), "{s}");
+    assert!(s.contains("\"status\": \"same\""), "{s}");
+    assert!(s.contains("\"action\": \"update\""), "{s}");
+    assert!(s.contains("\"policy\": \"auto\""), "{s}");
+    assert_eq!(
+        installs(&dir),
+        "",
+        "plan --json must not reinstall anything"
+    );
+}
+
+#[test]
+fn check_json_includes_status_field() {
+    let dir = setup("check-status-json");
+    let out = run(&dir, &["check", "--json"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let s = stdout_of(&out);
+    assert!(s.contains("\"status\": \"changed\""), "{s}");
+    assert!(s.contains("\"status\": \"same\""), "{s}");
+    assert!(s.contains("\"status\": \"unknown\""), "{s}");
+}
+
+#[test]
+fn policy_notify_never_installs() {
+    let dir = setup("policy-notify");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "policy = \"notify\"\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    // Errors still drive exit 2; notify policy holds every update.
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(installs(&dir), "", "notify policy must not install");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("0 updated"), "{err}");
+}
+
+#[test]
+fn policy_pinned_only_updates_only_pinned_plugins() {
+    let dir = setup("policy-pinned-only");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "policy = \"pinned-only\"\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(2)); // check errors remain
+    let log = installs(&dir);
+    assert!(
+        log.contains("plugin install ragamo/herdr-flock"),
+        "pinned plugin must be updated: {log}"
+    );
+    assert!(
+        !log.contains("smarzban/herdr-file-viewer"),
+        "unpinned plugin must be held: {log}"
+    );
+}
+
+#[test]
+fn allow_restricts_updates_by_owner_repo() {
+    let dir = setup("allow");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "allow = [\"ragamo/*\"]\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(2));
+    let log = installs(&dir);
+    assert!(
+        log.contains("plugin install ragamo/herdr-flock"),
+        "allowed owner must be updated: {log}"
+    );
+    assert!(
+        !log.contains("smarzban/herdr-file-viewer"),
+        "owner outside allow list must be held: {log}"
+    );
+}
+
+#[test]
+fn apply_acts_like_update() {
+    let dir = setup("apply");
+    let out = run(&dir, &["apply"], None);
+    assert_eq!(out.status.code(), Some(2)); // check errors
+    let log = installs(&dir);
+    assert!(log.contains("smarzban/herdr-file-viewer"), "{log}");
+    assert!(log.contains("ragamo/herdr-flock"), "{log}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("2 updated, 0 failed"), "{err}");
+}

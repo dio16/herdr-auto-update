@@ -2,7 +2,7 @@
 // via `git ls-remote`, then reinstall outdated ones through the herdr CLI.
 // All subprocess calls use argv arrays - no shell interpolation anywhere.
 
-use crate::config::Config;
+use crate::config::{Config, Policy};
 use crate::registry;
 use serde::Serialize;
 use std::io::Read;
@@ -17,6 +17,20 @@ use std::time::{Duration, Instant};
 /// (`http.connectTimeout` is not a real git-config key, hence absent.)
 const GIT_TIMEOUT_ARGS: [&str; 4] = ["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15"];
 
+/// Classification of a plugin relative to its upstream ref (v0.2 granularity).
+/// `unknown` covers check errors and non-GitHub entries; v0.3 refines
+/// `changed` into `behind`/`ahead`/`diverged` via the compare API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Status {
+    /// Upstream ref matches the installed commit.
+    Same,
+    /// Upstream ref differs from the installed commit.
+    Changed,
+    /// Remote could not be resolved (network error, invalid entry, skipped kind).
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginStatus {
     pub plugin_id: String,
@@ -27,10 +41,41 @@ pub struct PluginStatus {
     pub installed_sha: String,
     pub remote_sha: Option<String>,
     pub update_available: bool,
+    pub status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Action {
+    /// Install the available update.
+    Update,
+    /// Keep the installed version (policy, exclude, allow, or no change).
+    Hold,
+    /// Upstream state could not be determined.
+    Error,
+}
+
+/// One plugin's verdict from the Policy Engine: what `apply` would do with
+/// it, and why. `plan` prints these; `apply` executes `Update` entries.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEntry {
+    pub plugin_id: String,
+    pub owner: String,
+    pub repo: String,
+    pub installed_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_sha: Option<String>,
+    pub status: Status,
+    pub policy: crate::config::Policy,
+    pub action: Action,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 pub fn run_startup(cfg: &Config, json: bool) -> ExitCode {
@@ -78,6 +123,15 @@ pub fn run_check(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
 }
 
 pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    // `update` is the composition of plan + apply (§5.7): analyze with the
+    // Policy Engine, then execute the UPDATE actions.
+    run_apply(cfg, json, only)
+}
+
+/// `plan`: analyze only — print what would happen, execute nothing. Exit
+/// code follows the unified contract: `2` on check errors, `1` when updates
+/// are available, `0` otherwise.
+pub fn run_plan(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     let statuses = match collect(cfg, only) {
         Ok(s) => s,
         Err(e) => {
@@ -85,59 +139,117 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let plan = build_plan(cfg, &statuses);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+    } else {
+        for e in &plan {
+            println!("{}", e.plugin_id);
+            println!("  installed: {}", short(&e.installed_sha));
+            if let Some(r) = &e.remote_sha {
+                println!("  remote: {}", short(r));
+            }
+            println!("  status: {}", status_label(e.status));
+            println!("  policy: {}", policy_label(e.policy));
+            println!("  action: {}", action_label(e.action));
+            if let Some(r) = &e.reason {
+                println!("  reason: {r}");
+            }
+            println!();
+        }
+    }
+    let pending = statuses.iter().filter(|s| s.update_available).count();
+    let errors = statuses.iter().filter(|s| s.error.is_some()).count();
+    if errors > 0 {
+        ExitCode::from(2)
+    } else if pending > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `apply`: execute the plan — install every plugin whose action is UPDATE.
+/// Held and errored entries are reported but not installed.
+pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    let statuses = match collect(cfg, only) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let plan = build_plan(cfg, &statuses);
 
     let mut updated: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut excluded: Vec<String> = Vec::new();
+    let mut held: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for s in &statuses {
-        if let Some(err) = &s.error {
-            if !json {
-                eprintln!("  [{}] error: {err}", s.plugin_id);
+    for e in &plan {
+        match e.action {
+            Action::Error => {
+                if !json {
+                    if let Some(err) = &e.reason {
+                        eprintln!("  [{}] error: {err}", e.plugin_id);
+                    }
+                }
+                errors.push(e.plugin_id.clone());
             }
-            errors.push(s.plugin_id.clone());
-            continue;
-        }
-        if !s.update_available {
-            if !json {
-                println!(
-                    "  [{}] up to date ({})",
-                    s.plugin_id,
-                    short(&s.installed_sha)
-                );
+            Action::Hold => {
+                if e.status == Status::Same {
+                    if !json {
+                        println!(
+                            "  [{}] up to date ({})",
+                            e.plugin_id,
+                            short(&e.installed_sha)
+                        );
+                    }
+                    continue;
+                }
+                if cfg.is_excluded(&e.plugin_id) {
+                    excluded.push(e.plugin_id.clone());
+                    if !json {
+                        println!(
+                            "  [{}] update available ({}) but excluded",
+                            e.plugin_id,
+                            short(&e.installed_sha)
+                        );
+                    }
+                } else {
+                    held.push(e.plugin_id.clone());
+                    if !json {
+                        let why = e.reason.as_deref().unwrap_or("held");
+                        println!(
+                            "  [{}] update available ({}) but held ({why})",
+                            e.plugin_id,
+                            short(&e.installed_sha)
+                        );
+                    }
+                }
             }
-            continue;
-        }
-        if cfg.is_excluded(&s.plugin_id) {
-            excluded.push(s.plugin_id.clone());
-            if !json {
-                println!(
-                    "  [{}] update available ({}) but excluded",
-                    s.plugin_id,
-                    short(&s.installed_sha)
-                );
+            Action::Update => {
+                if !json {
+                    let pin = e
+                        .requested_ref
+                        .as_deref()
+                        .map(|r| format!(" (pinned {r})"))
+                        .unwrap_or_default();
+                    println!(
+                        "  [{}] updating {} -> {}{}",
+                        e.plugin_id,
+                        short(&e.installed_sha),
+                        short(e.remote_sha.as_deref().unwrap_or("?")),
+                        pin
+                    );
+                }
+                if apply_update(&e.owner, &e.repo, e.requested_ref.as_deref()) {
+                    updated.push(e.plugin_id.clone());
+                } else {
+                    failed.push(e.plugin_id.clone());
+                }
             }
-            continue;
-        }
-        if !json {
-            let pin = s
-                .requested_ref
-                .as_deref()
-                .map(|r| format!(" (pinned {r})"))
-                .unwrap_or_default();
-            println!(
-                "  [{}] updating {} -> {}{}",
-                s.plugin_id,
-                short(&s.installed_sha),
-                short(s.remote_sha.as_deref().unwrap_or("?")),
-                pin
-            );
-        }
-        if apply_update(&s.owner, &s.repo, s.requested_ref.as_deref()) {
-            updated.push(s.plugin_id.clone());
-        } else {
-            failed.push(s.plugin_id.clone());
         }
     }
 
@@ -146,6 +258,7 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             "updated": updated,
             "failed": failed,
             "excluded": excluded,
+            "held": held,
             "errors": errors,
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -155,11 +268,14 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             updated.len(),
             failed.len()
         );
+        if !held.is_empty() {
+            summary.push_str(&format!(", {} held", held.len()));
+        }
         if !errors.is_empty() {
             summary.push_str(&format!(", {} error(s)", errors.len()));
         }
         eprintln!("{summary}");
-        notify(cfg, updated.len(), failed.len(), errors.len());
+        notify(cfg, updated.len(), failed.len(), errors.len(), held.len());
     }
 
     // Check errors take precedence over install failures so scripts can tell
@@ -173,20 +289,74 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     }
 }
 
+/// Policy Engine: decide the action for every plugin. Pure — no I/O — so
+/// `plan` and `apply` share one decision path.
+fn build_plan(cfg: &Config, statuses: &[PluginStatus]) -> Vec<PlanEntry> {
+    statuses
+        .iter()
+        .map(|s| {
+            let (action, reason) = decide(cfg, s);
+            PlanEntry {
+                plugin_id: s.plugin_id.clone(),
+                owner: s.owner.clone(),
+                repo: s.repo.clone(),
+                installed_sha: s.installed_sha.clone(),
+                remote_sha: s.remote_sha.clone(),
+                status: s.status,
+                policy: cfg.policy,
+                action,
+                requested_ref: s.requested_ref.clone(),
+                reason,
+            }
+        })
+        .collect()
+}
+
+fn decide(cfg: &Config, s: &PluginStatus) -> (Action, Option<String>) {
+    if let Some(err) = &s.error {
+        return (Action::Error, Some(err.clone()));
+    }
+    if !s.update_available {
+        return (Action::Hold, Some("up to date".to_string()));
+    }
+    if cfg.is_excluded(&s.plugin_id) {
+        return (Action::Hold, Some("excluded".to_string()));
+    }
+    if !cfg.is_allowed(&s.owner, &s.repo) {
+        return (Action::Hold, Some("not in allow list".to_string()));
+    }
+    match cfg.policy {
+        Policy::Notify => (Action::Hold, Some("policy: notify".to_string())),
+        Policy::PinnedOnly if s.requested_ref.is_none() => {
+            (Action::Hold, Some("policy: pinned-only".to_string()))
+        }
+        Policy::Auto | Policy::PinnedOnly => (Action::Update, None),
+    }
+}
+
 /// Best-effort desktop notification through herdr's CLI. Failures are
 /// ignored: a missing notification API must not change the exit code.
-fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize) {
-    if !cfg.notify || (updated == 0 && failed == 0 && errors == 0) {
+fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize, held: usize) {
+    if !cfg.notify || (updated == 0 && failed == 0 && errors == 0 && held == 0) {
         return;
     }
-    let body = match (updated, failed, errors) {
-        (0, 0, e) => format!("{e} plugin(s) could not be checked"),
-        (0, f, 0) => format!("{f} plugin update(s) failed"),
-        (0, f, e) => format!("{f} plugin update(s) failed, {e} could not be checked"),
-        (u, 0, 0) => format!("{u} plugin(s) updated"),
-        (u, 0, e) => format!("{u} plugin(s) updated, {e} could not be checked"),
-        (u, f, 0) => format!("{u} updated, {f} failed"),
-        (u, f, e) => format!("{u} updated, {f} failed, {e} could not be checked"),
+    let mut parts: Vec<String> = Vec::new();
+    if updated > 0 {
+        parts.push(format!("{updated} plugin(s) updated"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if errors > 0 {
+        parts.push(format!("{errors} could not be checked"));
+    }
+    if held > 0 {
+        parts.push(format!("{held} held by policy"));
+    }
+    let body = if parts.is_empty() {
+        "no changes".to_string()
+    } else {
+        parts.join(", ")
     };
     let bin = registry::herdr_bin();
     let _ = Command::new(&bin)
@@ -277,6 +447,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 installed_sha: src.resolved_commit.clone().unwrap_or_default(),
                 remote_sha: None,
                 update_available: false,
+                status: Status::Unknown,
                 requested_ref: src.requested_ref.clone(),
                 error: Some("github source missing owner/repo/commit fields".to_string()),
             }));
@@ -291,6 +462,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 installed_sha: rc.clone(),
                 remote_sha: None,
                 update_available: false,
+                status: Status::Unknown,
                 requested_ref: src.requested_ref.clone(),
                 error: Some("invalid owner/repo recorded in registry".to_string()),
             }));
@@ -357,6 +529,11 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                     installed_sha: job.installed_sha.clone(),
                     remote_sha: Some(sha.clone()),
                     update_available: sha != job.installed_sha,
+                    status: if sha == job.installed_sha {
+                        Status::Same
+                    } else {
+                        Status::Changed
+                    },
                     requested_ref: job.requested_ref.clone(),
                     error: None,
                 },
@@ -368,6 +545,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                     installed_sha: job.installed_sha.clone(),
                     remote_sha: None,
                     update_available: false,
+                    status: Status::Unknown,
                     requested_ref: job.requested_ref.clone(),
                     error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
                 },
@@ -379,6 +557,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                     installed_sha: job.installed_sha.clone(),
                     remote_sha: None,
                     update_available: false,
+                    status: Status::Unknown,
                     requested_ref: job.requested_ref.clone(),
                     error: Some(e),
                 },
@@ -498,6 +677,30 @@ fn print_status(s: &PluginStatus) {
             s.plugin_id,
             short(&s.installed_sha)
         );
+    }
+}
+
+fn status_label(s: Status) -> &'static str {
+    match s {
+        Status::Same => "same",
+        Status::Changed => "changed",
+        Status::Unknown => "unknown",
+    }
+}
+
+fn policy_label(p: Policy) -> &'static str {
+    match p {
+        Policy::Auto => "auto",
+        Policy::Notify => "notify",
+        Policy::PinnedOnly => "pinned-only",
+    }
+}
+
+fn action_label(a: Action) -> &'static str {
+    match a {
+        Action::Update => "UPDATE",
+        Action::Hold => "HOLD",
+        Action::Error => "ERROR",
     }
 }
 

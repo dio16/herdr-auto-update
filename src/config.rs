@@ -1,8 +1,23 @@
 // Plugin configuration, read from HERDR_PLUGIN_CONFIG_DIR/config.toml
 // (herdr creates that directory on install) with CLI override support.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Update policy: what `update`/`apply`/`startup` may do with a plugin whose
+/// upstream ref changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Policy {
+    /// Install updates, honoring `allow` / `exclude` (default; v0.2 keeps
+    /// v0.1 behavior for compatibility).
+    Auto,
+    /// Check, report, and notify only; never install.
+    Notify,
+    /// Only update plugins pinned via `requested_ref` (installed with
+    /// `--ref`); unpinned plugins are held.
+    PinnedOnly,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -20,6 +35,12 @@ pub struct Config {
     /// Upper bound on concurrent remote checks. Bounded so a registry full of
     /// plugins cannot spawn an unbounded number of git processes.
     pub max_concurrency: usize,
+    /// Update policy: auto (default) | notify | pinned-only.
+    pub policy: Policy,
+    /// Restrict update targets to these `owner/repo` glob patterns
+    /// (e.g. `["ragamo/*", "*/herdr-file-viewer"]`). Empty = all GitHub
+    /// plugins.
+    pub allow: Vec<String>,
 }
 
 impl Default for Config {
@@ -30,6 +51,8 @@ impl Default for Config {
             exclude: Vec::new(),
             timeout_secs: 20,
             max_concurrency: 8,
+            policy: Policy::Auto,
+            allow: Vec::new(),
         }
     }
 }
@@ -38,6 +61,47 @@ impl Config {
     pub fn is_excluded(&self, plugin_id: &str) -> bool {
         self.exclude.iter().any(|e| e == plugin_id)
     }
+
+    /// Empty `allow` admits every owner/repo; otherwise at least one glob
+    /// pattern must match `owner/repo`.
+    pub fn is_allowed(&self, owner: &str, repo: &str) -> bool {
+        if self.allow.is_empty() {
+            return true;
+        }
+        let spec = format!("{owner}/{repo}");
+        self.allow.iter().any(|p| glob_match(p, &spec))
+    }
+}
+
+/// Minimal glob for `allow` patterns: `*` matches any sequence (including
+/// empty, crossing `/`), `?` exactly one non-`/` character. Keeps
+/// dependencies at serde/toml only.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == t[ti] || (p[pi] == '?' && t[ti] != '/')) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Load config; missing file or unset env vars yield defaults. Parse errors
@@ -80,6 +144,8 @@ mod tests {
         assert!(cfg.exclude.is_empty());
         assert_eq!(cfg.timeout_secs, 20);
         assert_eq!(cfg.max_concurrency, 8);
+        assert_eq!(cfg.policy, Policy::Auto);
+        assert!(cfg.allow.is_empty());
     }
 
     #[test]
@@ -89,7 +155,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\ntimeout_secs = 5\nmax_concurrency = 2\n",
+            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\ntimeout_secs = 5\nmax_concurrency = 2\npolicy = \"pinned-only\"\nallow = [\"ragamo/*\"]\n",
         )
         .unwrap();
         let cfg = load(Some(path.to_str().unwrap())).unwrap();
@@ -100,7 +166,36 @@ mod tests {
         assert!(!cfg.is_excluded("other"));
         assert_eq!(cfg.timeout_secs, 5);
         assert_eq!(cfg.max_concurrency, 2);
+        assert_eq!(cfg.policy, Policy::PinnedOnly);
+        assert!(cfg.is_allowed("ragamo", "herdr-flock"));
+        assert!(!cfg.is_allowed("dio16", "herdr-flock"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_policy_is_fatal() {
+        let dir = std::env::temp_dir().join(format!("hau-cfg-pol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "policy = \"everywhere\"\n").unwrap();
+        assert!(load(Some(path.to_str().unwrap())).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_matches() {
+        assert!(glob_match("ragamo/*", "ragamo/herdr-flock"));
+        assert!(glob_match("*/herdr-flock", "ragamo/herdr-flock"));
+        assert!(glob_match("*", "a/b"));
+        assert!(glob_match("a?c/x", "abc/x"));
+        assert!(!glob_match("ragamo/*", "dio16/herdr-flock"));
+        assert!(!glob_match("a?c", "a/c"));
+    }
+
+    #[test]
+    fn allow_empty_admits_all() {
+        let cfg = Config::default();
+        assert!(cfg.is_allowed("any", "thing"));
     }
 
     #[test]

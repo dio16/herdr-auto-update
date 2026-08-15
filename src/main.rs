@@ -12,17 +12,19 @@ const USAGE: &str = "\
 herdr-auto-update - check/update installed herdr plugins
 
 USAGE:
-    herdr-auto-update <startup|check|update> [--json] [--config <path>] [--only <plugin_id>]
+    herdr-auto-update <startup|check|plan|apply|update> [--json] [--config <path>] [--only <plugin_id>]
 
 COMMANDS:
     startup   check and reinstall outdated plugins (used by herdr's startup hook)
-    check     report plugins with newer commits upstream; exit 1 if any
-    update    check and reinstall all outdated plugins
+    check     report plugins with changed upstream refs; exit 1 if any
+    plan      analyze only: print status/policy/action per plugin, install nothing
+    apply     execute the plan: install every plugin whose action is UPDATE
+    update    check and reinstall all outdated plugins (plan + apply)
 
 FLAGS:
-    --json           machine-readable output (check/update)
+    --json           machine-readable output (check/plan/apply/update)
     --config <path>  override the plugin config file
-    --only <id>      restrict check/update to one plugin id
+    --only <id>      restrict plan/apply/update to one plugin id
     -V, --version    print version
     -h, --help       print help
 
@@ -90,7 +92,8 @@ fn main() -> ExitCode {
             updater::run_startup(&cfg, json)
         }
         "check" => updater::run_check(&cfg, json, only.as_deref()),
-        "update" => updater::run_update(&cfg, json, only.as_deref()),
+        "plan" => updater::run_plan(&cfg, json, only.as_deref()),
+        "apply" | "update" => updater::run_apply(&cfg, json, only.as_deref()),
         other => {
             eprintln!("error: unknown command '{other}'");
             eprintln!("{USAGE}");
