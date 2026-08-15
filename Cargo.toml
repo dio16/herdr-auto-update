@@ -1,6 +1,6 @@
 [package]
 name = "herdr-auto-update"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.75"
 description = "herdr plugin: check installed plugins for newer upstream commits and reinstall them, optionally at server startup"

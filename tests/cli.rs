@@ -653,12 +653,14 @@ fn plan_reports_actions_without_installing() {
 }
 
 #[test]
-fn plan_clean_registry_exits_1_without_installing() {
+fn plan_clean_registry_notify_holds_exits_0() {
     let dir = setup("plan-clean");
     write_registry(&dir, CLEAN_REGISTRY);
+    // No config file -> v1.0 default policy notify: upstream changed
+    // (file-viewer behind) but nothing would apply -> exit 0 (v1.0.1
+    // contract: 1 means "updates would apply", not "upstream moved").
     let out = run(&dir, &["plan"], None);
-    // Updates pending, no errors -> 1.
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(0));
     assert_eq!(installs(&dir), "", "plan must not reinstall anything");
 }
 
@@ -843,6 +845,175 @@ fn rollback_reinstalls_previous_commit() {
 }
 
 #[test]
+fn rollback_rewinds_only_latest_update_per_plugin() {
+    let dir = setup("rollback-multi");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    let a = "350f3f5be79d136933ba36c8c8dd60f79df28002";
+    let b = "71d4c1c3706e7958c714789b035a99d949620a9e";
+    let c = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    std::fs::write(
+        dir.join("state.json"),
+        format!(
+            r#"{{"version":1,"entries":[
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{a}","current_sha":"{b}","updated_at":"2026-08-15T00:00:00Z","result":"updated"}},
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{b}","current_sha":"{c}","updated_at":"2026-08-15T00:01:00Z","result":"updated"}}
+]}}"#
+        ),
+    )
+    .unwrap();
+    let out = run(&dir, &["rollback"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let log = installs(&dir);
+    assert!(
+        log.contains(&format!("smarzban/herdr-file-viewer --ref {b} --yes")),
+        "rollback must install the commit before the LATEST update: {log}"
+    );
+    assert!(
+        !log.contains(&format!("--ref {a}")),
+        "rollback must not rewind older history: {log}"
+    );
+    let st = std::fs::read_to_string(dir.join("state.json")).unwrap();
+    assert!(
+        st.contains("\"result\": \"rolled_back\""),
+        "rollback must be recorded in state.json: {st}"
+    );
+    assert!(
+        st.contains(&format!("\"current_sha\": \"{b}\"")),
+        "rolled_back entry must point at the restored commit: {st}"
+    );
+}
+
+#[test]
+fn rollback_skips_plugin_already_rolled_back() {
+    let dir = setup("rollback-already");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    let a = "350f3f5be79d136933ba36c8c8dd60f79df28002";
+    let b = "71d4c1c3706e7958c714789b035a99d949620a9e";
+    std::fs::write(
+        dir.join("state.json"),
+        format!(
+            r#"{{"version":1,"entries":[
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{a}","current_sha":"{b}","updated_at":"2026-08-15T00:00:00Z","result":"updated"}},
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{b}","current_sha":"{a}","updated_at":"2026-08-15T00:01:00Z","result":"rolled_back"}}
+]}}"#
+        ),
+    )
+    .unwrap();
+    let out = run(&dir, &["rollback"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(1)); // nothing to roll back
+    assert_eq!(
+        installs(&dir),
+        "",
+        "already rolled back must not reinstall anything"
+    );
+}
+
+#[test]
+fn resume_reinstalls_original_tracking_ref() {
+    let dir = setup("resume");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    let a = "350f3f5be79d136933ba36c8c8dd60f79df28002";
+    let b = "71d4c1c3706e7958c714789b035a99d949620a9e";
+    std::fs::write(
+        dir.join("state.json"),
+        format!(
+            r#"{{"version":1,"entries":[
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{a}","current_sha":"{b}","ref":"main","updated_at":"2026-08-15T00:00:00Z","result":"updated"}},
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{b}","current_sha":"{a}","ref":"main","updated_at":"2026-08-15T00:01:00Z","result":"rolled_back"}}
+]}}"#
+        ),
+    )
+    .unwrap();
+    let out = run(&dir, &["resume"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let log = installs(&dir);
+    assert!(
+        log.contains("smarzban/herdr-file-viewer --ref main --yes"),
+        "resume must reinstall with the original tracking ref: {log}"
+    );
+    let st = std::fs::read_to_string(dir.join("state.json")).unwrap();
+    assert!(
+        st.contains("\"result\": \"updated\""),
+        "resume must record the rejoin in state.json: {st}"
+    );
+    let s = stdout_of(&out);
+    assert!(s.contains("resuming tracking ref main"), "{s}");
+}
+
+#[test]
+fn resume_default_branch_installs_without_ref() {
+    let dir = setup("resume-default");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    let a = "350f3f5be79d136933ba36c8c8dd60f79df28002";
+    let b = "71d4c1c3706e7958c714789b035a99d949620a9e";
+    std::fs::write(
+        dir.join("state.json"),
+        format!(
+            r#"{{"version":1,"entries":[
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{a}","current_sha":"{b}","updated_at":"2026-08-15T00:00:00Z","result":"updated"}},
+{{"plugin_id":"herdr-file-viewer","previous_sha":"{b}","current_sha":"{a}","updated_at":"2026-08-15T00:01:00Z","result":"rolled_back"}}
+]}}"#
+        ),
+    )
+    .unwrap();
+    let out = run(&dir, &["resume"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let log = installs(&dir);
+    assert!(
+        log.contains("smarzban/herdr-file-viewer --yes"),
+        "resume of a default-branch tracker must install without --ref: {log}"
+    );
+    assert!(!log.contains("--ref"), "{log}");
+}
+
+#[test]
+fn plan_exit_reflects_actions_not_raw_changes() {
+    // notify policy: upstream changed (behind) but action is HOLD -> 0.
+    let dir = setup("plan-exit-notify");
+    write_registry(&dir, CLEAN_REGISTRY);
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "policy = \"notify\"\n").unwrap();
+    let out = run(&dir, &["plan"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0), "notify+HOLD must exit 0");
+    let s = stdout_of(&out);
+    assert!(s.contains("action: HOLD"), "{s}");
+
+    // auto policy: behind -> UPDATE -> 1.
+    let dir2 = setup("plan-exit-auto");
+    write_registry(&dir2, CLEAN_REGISTRY);
+    let cfg2 = auto_cfg(&dir2, "");
+    let out2 = run(&dir2, &["plan"], Some(&cfg2));
+    assert_eq!(out2.status.code(), Some(1), "auto+UPDATE must exit 1");
+    let s2 = stdout_of(&out2);
+    assert!(s2.contains("action: UPDATE"), "{s2}");
+
+    // diverged + allow_force_push -> UPDATE even though update_available is
+    // false for those plugins -> 1 (contract: 1 = updates would apply).
+    let dir3 = setup("plan-exit-force");
+    write_registry(&dir3, CLEAN_REGISTRY);
+    let stub = dir3.join("stub-curl.sh");
+    if stub.exists() {
+        std::fs::write(&stub, "#!/bin/sh\necho '{\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":2}'\n").unwrap();
+    } else {
+        std::fs::write(
+            dir3.join("stub-curl.cmd"),
+            "@echo off\r\necho {\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":2}\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+    }
+    let cfg3 = dir3.join("config.toml");
+    std::fs::write(&cfg3, "policy = \"auto\"\nallow_force_push = true\n").unwrap();
+    let out3 = run(&dir3, &["plan"], Some(&cfg3));
+    assert_eq!(out3.status.code(), Some(1), "force-push UPDATE must exit 1");
+    let s3 = stdout_of(&out3);
+    assert!(s3.contains("action: UPDATE"), "{s3}");
+}
+
+#[test]
 fn update_records_state_history() {
     let dir = setup("state-record");
     write_registry(&dir, CLEAN_REGISTRY);
@@ -886,8 +1057,10 @@ const PINNED_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
 fn plan_reports_ref_channel() {
     let dir = setup("plan-channel");
     write_registry(&dir, PINNED_REGISTRY);
+    // Default notify policy: every pin is held, nothing would apply -> 0
+    // (v1.0.1 contract; upstream moved but no UPDATE action exists).
     let out = run(&dir, &["plan"], None);
-    assert_eq!(out.status.code(), Some(1)); // updates available, no errors
+    assert_eq!(out.status.code(), Some(0));
     let s = stdout_of(&out);
     let block: Vec<&str> = s.lines().collect();
     for (name, want) in [

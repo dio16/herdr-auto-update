@@ -237,15 +237,29 @@ herdr-auto-update history --json
 
 ### Roll back an update
 
-`herdr-auto-update rollback` — reinstall each plugin at its previous commit
-(`herdr plugin install <owner>/<repo> --ref <previous-sha>`), using the most
-recent recorded state. `rollback --only <plugin_id>` restricts the target.
-Plugins without a recorded previous commit are skipped with a warning.
+`herdr-auto-update rollback` — reinstall each plugin at the commit recorded
+before its **most recent** update (`herdr plugin install <owner>/<repo>
+--ref <previous-sha>`), using state. Older history is never rewound: an
+A→B→C trail rolls back to B, not to A. `rollback --only <plugin_id>`
+restricts the target. Plugins without a recorded previous commit are
+skipped with a warning; a plugin that is already rolled back is left alone.
+
+Rolling back pin installs the previous commit, so herdr records it as a
+commit pin (`--ref <sha>`). By design that **quarantines** the plugin: it is
+no longer auto-updated, and `plan` marks it "pinned by rollback". To rejoin
+the tracking ref (branch or default) that was recorded before the rollback,
+run `resume` — it reinstalls from that ref and the plugin becomes an
+auto-update candidate again.
 
 ```bash
 herdr-auto-update rollback
 herdr-auto-update rollback --only herdr-file-viewer
+herdr-auto-update resume
+herdr-auto-update resume --only herdr-file-viewer
 ```
+
+Every rollback and resume is appended to `state.json`, so `history` shows
+the full trail: `updated` → `rolled_back` → `updated`.
 
 ### Common flags
 
@@ -262,7 +276,7 @@ herdr-auto-update rollback --only herdr-file-viewer
 | Code | Meaning |
 |---|---|
 | `0` | ok / everything up to date |
-| `1` | updates available (check) or one or more reinstalls failed (update/startup) |
+| `1` | updates available (check), updates would apply (plan), one or more reinstalls failed (update/startup), or nothing to roll back / resume |
 | `2` | fatal error, bad usage, or one or more plugin checks errored |
 
 ## Development

@@ -7,6 +7,7 @@ use crate::config::{Config, Policy};
 use crate::registry;
 use crate::state;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::Read;
 use std::process::{Child, Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,6 +78,11 @@ pub struct PluginStatus {
     pub requested_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Informational note explaining a status beyond the machine fields
+    /// (e.g. "pinned by rollback; run `resume`"). Never changes the action
+    /// on its own; `plan`/`check` surface it as the hold reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -191,11 +197,15 @@ pub fn run_plan(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             println!();
         }
     }
-    let pending = statuses.iter().filter(|s| s.update_available).count();
+    // Contract: exit 1 means "updates would apply" (at least one UPDATE
+    // action under the active policy), not merely "some upstream ref
+    // changed". A notify-policy plan that holds everything exits 0 even
+    // though upstream moved (v1.0.1 P0 fix).
+    let pending = plan.iter().any(|p| p.action == Action::Update);
     let errors = statuses.iter().filter(|s| s.error.is_some()).count();
     if errors > 0 {
         ExitCode::from(2)
-    } else if pending > 0 {
+    } else if pending {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -361,7 +371,7 @@ fn decide(cfg: &Config, s: &PluginStatus) -> (Action, Option<String>) {
     // Only fast-forwardable updates (Behind) are ever applied. Same / ahead /
     // diverged / unknown never update - installing them could lose commits.
     let why = match s.status {
-        Status::Same => Some("up to date".to_string()),
+        Status::Same => Some(s.note.clone().unwrap_or_else(|| "up to date".to_string())),
         Status::Ahead => {
             Some("installed commit is ahead of upstream (upstream reset?)".to_string())
         }
@@ -514,7 +524,7 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         eprintln!("error: no config dir; cannot locate state.json");
         return ExitCode::from(2);
     };
-    let st = state::State::load(&dir);
+    let mut st = state::State::load(&dir);
     if st.entries.is_empty() {
         if !json {
             eprintln!("[herdr-auto-update] no updates recorded - nothing to roll back");
@@ -522,24 +532,37 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let targets: Vec<&state::StateEntry> = match only {
+    // Roll back only the most recent update per plugin. Older history is
+    // left alone: rolling back an A->B->C trail must install B once, not
+    // rewind through every recorded update (v1.0.1 P0 fix). A plugin whose
+    // newest entry is already `rolled_back` is skipped - it is already
+    // rolled back, and resume is the way back onto the tracking ref.
+    let targets: Vec<state::StateEntry> = match only {
         Some(id) => match st.latest_for(id) {
-            Some(e) if e.result == "updated" => vec![e],
-            _ => {
+            Some(e) if e.result == "updated" => vec![e.clone()],
+            Some(_) => {
+                eprintln!("  [{id}] already rolled back; run `resume` to rejoin the tracking ref");
+                Vec::new()
+            }
+            None => {
                 eprintln!("error: no update recorded for plugin '{id}'");
                 return ExitCode::from(2);
             }
         },
-        None => st
-            .entries
-            .iter()
-            .rev()
-            .filter(|e| e.result == "updated")
-            .collect(),
+        None => {
+            let mut seen: HashSet<&str> = HashSet::new();
+            st.entries
+                .iter()
+                .rev()
+                .filter(|e| seen.insert(e.plugin_id.as_str()))
+                .filter(|e| e.result == "updated")
+                .cloned()
+                .collect()
+        }
     };
 
     let mut rolled_back: Vec<&str> = Vec::new();
-    for e in targets {
+    for e in &targets {
         if e.previous_sha.is_empty() {
             eprintln!(
                 "  [{}] cannot roll back: no previous commit recorded",
@@ -563,6 +586,20 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             );
         }
         if apply_update(&owner, &repo, Some(&e.previous_sha)) {
+            // Record the rollback. herdr keeps the rolled-back SHA as
+            // requested_ref, so this entry is the only place the original
+            // tracking ref survives; `resume` needs it (v1.0.1).
+            st.append(state::StateEntry {
+                plugin_id: e.plugin_id.clone(),
+                previous_sha: e.current_sha.clone(),
+                current_sha: e.previous_sha.clone(),
+                requested_ref: e.requested_ref.clone(),
+                updated_at: state::rfc3339_now(),
+                result: "rolled_back".to_string(),
+            });
+            if let Err(err) = st.save(&dir) {
+                eprintln!("  warning: {err}");
+            }
             rolled_back.push(&e.plugin_id);
         }
     }
@@ -573,6 +610,78 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         );
     }
     if rolled_back.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `resume`: reinstall a plugin from the tracking ref recorded before its
+/// last rollback, undoing the commit pin that rollback introduced and
+/// rejoining the auto-update channel (v1.0.1 P0 design fix: rollback =
+/// quarantine, resume = back to the original tracking ref).
+pub fn run_resume(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    let Some(dir) = cfg.data_dir() else {
+        eprintln!("error: no config dir; cannot locate state.json");
+        return ExitCode::from(2);
+    };
+    let mut st = state::State::load(&dir);
+
+    // Most recent `rolled_back` entry per plugin: it carries the original
+    // tracking ref (requested_ref) captured before the rollback.
+    let targets: Vec<state::StateEntry> = match only {
+        Some(id) => match st.latest_for(id) {
+            Some(e) if e.result == "rolled_back" => vec![e.clone()],
+            _ => {
+                eprintln!("error: no rollback recorded for plugin '{id}'");
+                return ExitCode::from(2);
+            }
+        },
+        None => {
+            let mut seen: HashSet<&str> = HashSet::new();
+            st.entries
+                .iter()
+                .rev()
+                .filter(|e| seen.insert(e.plugin_id.as_str()))
+                .filter(|e| e.result == "rolled_back")
+                .cloned()
+                .collect()
+        }
+    };
+
+    let mut resumed: Vec<&str> = Vec::new();
+    for e in &targets {
+        let Some((owner, repo)) = owner_repo_of(&e.plugin_id) else {
+            eprintln!("  [{}] cannot resume: plugin not in registry", e.plugin_id);
+            continue;
+        };
+        if !json {
+            let track = e.requested_ref.as_deref().unwrap_or("<default branch>");
+            println!("  [{}] resuming tracking ref {track}", e.plugin_id);
+        }
+        if apply_update(&owner, &repo, e.requested_ref.as_deref()) {
+            // Record the resume as an update entry: the plugin is back on
+            // the tracking ref at the current upstream commit.
+            let current_sha =
+                resolved_commit_of(&e.plugin_id).unwrap_or_else(|| e.current_sha.clone());
+            st.append(state::StateEntry {
+                plugin_id: e.plugin_id.clone(),
+                previous_sha: e.current_sha.clone(),
+                current_sha,
+                requested_ref: e.requested_ref.clone(),
+                updated_at: state::rfc3339_now(),
+                result: "updated".to_string(),
+            });
+            if let Err(err) = st.save(&dir) {
+                eprintln!("  warning: {err}");
+            }
+            resumed.push(&e.plugin_id);
+        }
+    }
+    if !json {
+        eprintln!("[herdr-auto-update] {} plugin(s) resumed", resumed.len());
+    }
+    if resumed.is_empty() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -619,6 +728,17 @@ fn owner_repo_of(plugin_id: &str) -> Option<(String, String)> {
         })
 }
 
+/// Current resolved commit for a plugin id from herdr's registry. `None`
+/// when the plugin is absent or the registry has no commit recorded.
+fn resolved_commit_of(plugin_id: &str) -> Option<String> {
+    let plugins = registry::list_installed().ok()?;
+    plugins
+        .iter()
+        .find(|p| p.plugin_id == plugin_id)
+        .and_then(|p| p.source.as_ref())
+        .and_then(|s| s.resolved_commit.clone())
+}
+
 /// A plugin whose remote commit still needs resolving (network call).
 struct RemoteJob {
     index: usize,
@@ -635,6 +755,10 @@ struct RemoteJob {
 /// can never silently no-op.
 fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String> {
     let plugins = registry::list_installed()?;
+    // Loaded once for the commit-pinned branch: a plugin whose newest state
+    // entry is `rolled_back` is commit-pinned by a rollback (quarantine) and
+    // gets a note telling the user `resume` restores tracking (v1.0.1).
+    let rollback_state = cfg.data_dir().map(|d| state::State::load(&d));
 
     // Resolve each plugin to either an immediate status (skipped kinds,
     // invalid entries) or a remote-resolution job. The remote checks run in
@@ -681,6 +805,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 ref_kind: ref_kind(src.requested_ref.as_deref()),
                 requested_ref: src.requested_ref.clone(),
                 error: Some("github source missing owner/repo/commit fields".to_string()),
+                note: None,
             }));
             continue;
         };
@@ -697,6 +822,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 ref_kind: ref_kind(src.requested_ref.as_deref()),
                 requested_ref: src.requested_ref.clone(),
                 error: Some("invalid owner/repo recorded in registry".to_string()),
+                note: None,
             }));
             continue;
         }
@@ -704,6 +830,11 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
         // installed commit, so it can never be behind upstream and is never
         // updated. Skip the network entirely (v0.4 ref channels).
         if ref_kind(src.requested_ref.as_deref()) == RefKind::Commit {
+            let note = rollback_state
+                .as_ref()
+                .and_then(|s| s.latest_for(&p.plugin_id))
+                .filter(|e| e.result == "rolled_back")
+                .map(|_| "pinned by rollback; run `resume` to rejoin the tracking ref".to_string());
             statuses.push(Some(PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: owner.clone(),
@@ -716,6 +847,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 ref_kind: RefKind::Commit,
                 requested_ref: src.requested_ref.clone(),
                 error: None,
+                note,
             }));
             continue;
         }
@@ -786,6 +918,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 ref_kind: ref_kind(job.requested_ref.as_deref()),
                 requested_ref: job.requested_ref.clone(),
                 error: result.error,
+                note: None,
             };
             statuses[job.index] = Some(status);
         }

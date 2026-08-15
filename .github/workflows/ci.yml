@@ -37,3 +37,6 @@ jobs:
       - name: Launcher smoke test (unix)
         if: runner.os != 'Windows'
         run: sh bin/herdr-auto-update --version
+      - name: Launcher syntax check (unix)
+        if: runner.os != 'Windows'
+        run: sh -n bin/herdr-auto-update
