@@ -6,7 +6,7 @@ use crate::config::{Config, Policy};
 use crate::registry;
 use serde::Serialize;
 use std::io::Read;
-use std::process::{Command, ExitCode, Output, Stdio};
+use std::process::{Child, Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -636,20 +636,45 @@ fn run_git_with_timeout(args: &[&str], timeout_secs: u64) -> Result<Output, Stri
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     return Err(format!("git ls-remote timed out after {timeout_secs}s"));
                 }
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_process_tree(&mut child);
                 return Err(format!("cannot wait for git: {e}"));
             }
         }
         // Brief sleep so a hung child does not busy-spin the worker.
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Terminate the child and its whole process tree, then reap it.
+///
+/// On Unix, killing the direct child is enough. On Windows a `.cmd`/`.bat`
+/// stub runs under `cmd.exe /c`, and `Child::kill()` (TerminateProcess)
+/// only terminates that direct child — grandchildren such as `ping` or
+/// git's ssh/remote-helper children survive and `wait()` blocks until they
+/// exit on their own. `taskkill /T /F` kills the tree, so the deadline is
+/// actually enforced. Windows-only: on Unix this is just kill + wait.
+fn kill_process_tree(child: &mut Child) {
+    // Order matters on Windows: `taskkill /T /F` must run while the tree is
+    // still intact. `Child::kill()` (TerminateProcess) terminates only the
+    // direct child — for a `.cmd`/`.bat` stub that is `cmd.exe` itself —
+    // orphaning grandchildren (ping, ssh, git remote-helpers) that keep the
+    // inherited pipe write-ends open. A later taskkill then fails (exit 128)
+    // because the dead cmd.exe is no longer enumerable, and `wait()` blocks
+    // until the orphans exit on their own.
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// git binary; HERDR_AUTO_UPDATE_GIT overrides it (used by the test suite to

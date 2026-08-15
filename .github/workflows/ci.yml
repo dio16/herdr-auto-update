@@ -24,6 +24,7 @@ jobs:
       - name: Test
         run: cargo test --all-targets
       - name: Manifest version consistency
+        shell: bash
         run: |
           cargo_ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
           plugin_ver=$(grep -m1 '^version' herdr-plugin.toml | sed 's/.*= *"\(.*\)"/\1/')
