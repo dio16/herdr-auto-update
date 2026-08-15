@@ -39,6 +39,8 @@ which replaces the managed checkout while preserving plugin config and state.
 - herdr >= 0.7.0
 - `git` on PATH (used for the upstream check; herdr's own plugin install also
   requires it)
+- `curl` on PATH (used to classify update direction via the GitHub compare
+  API; when unavailable every changed plugin is reported as `unknown`)
 - A Rust toolchain on the machine that installs the plugin (the plugin builds
   itself with `cargo build --release` during `herdr plugin install`)
 
@@ -100,6 +102,15 @@ policy = "auto"
 # Restrict update targets to owner/repo glob patterns (default: all GitHub
 # plugins). `*` matches any sequence (including `/`), `?` one non-`/` char.
 # allow = ["ragamo/*", "dio16/herdr-*"]
+
+# Only fast-forward updates are ever applied (default true). Classification
+# enforces this: `behind` (installed is an ancestor of upstream) is the only
+# status that updates; `ahead` / `diverged` / `unknown` are held.
+require_fast_forward = true
+
+# Allow installing a diverged upstream (history rewritten by a force push).
+# Default false: diverged plugins are held until you decide.
+allow_force_push = false
 ```
 
 ## CLI
@@ -123,7 +134,13 @@ herdr-auto-update check
 `herdr-auto-update check --json` — same check, machine-readable output as a
 JSON array of plugin statuses (one object per plugin with `plugin_id`, `owner`,
 `repo`, `version`, `installed_sha`, `remote_sha`, `update_available`, `status`
-(`same`/`changed`/`unknown`), `requested_ref`, `error`).
+(`same`/`behind`/`ahead`/`diverged`/`unknown`), `requested_ref`, `error`).
+
+`status` is classified via the GitHub compare API (`installed...upstream`):
+`behind` = upstream has commits you lack (updateable), `ahead` = you have
+commits upstream lacks, `diverged` = both sides have unique commits (force
+push), `unknown` = classification failed (network/rate limit) — degraded to
+the safe side (never auto-updated).
 
 ```bash
 herdr-auto-update check --json
@@ -181,6 +198,30 @@ reinstall outdated plugins per the configured `policy`, unless
 herdr-auto-update startup
 ```
 
+### Update history
+
+Every applied update is recorded in `state.json` inside the plugin config
+directory (append-only; the latest entry per plugin is the rollback target).
+`herdr-auto-update history` prints the audit trail; `history --json` emits it
+machine-readable.
+
+```bash
+herdr-auto-update history
+herdr-auto-update history --json
+```
+
+### Roll back an update
+
+`herdr-auto-update rollback` — reinstall each plugin at its previous commit
+(`herdr plugin install <owner>/<repo> --ref <previous-sha>`), using the most
+recent recorded state. `rollback --only <plugin_id>` restricts the target.
+Plugins without a recorded previous commit are skipped with a warning.
+
+```bash
+herdr-auto-update rollback
+herdr-auto-update rollback --only herdr-file-viewer
+```
+
 ### Common flags
 
 | Flag | Description |
@@ -216,8 +257,10 @@ repository on GitHub (the index refreshes automatically).
 - All subprocess execution uses argv arrays; plugin ids, owners, and repos
   from the registry are validated (`[A-Za-z0-9._-]`, length-bounded) before
   being placed into URLs or arguments.
-- The plugin never writes files and never evaluates shell code; the only
-  writes that happen are performed by herdr's own installer.
+- The plugin never evaluates shell code; subprocesses are `git`, `curl`, and
+  herdr's own installer. The only files it writes are `state.json` and
+  `compare-cache.json` in herdr's plugin config directory (needed for
+  rollback and rate-limit-safe classification).
 - Dependencies are minimal (`serde`, `serde_json`, `toml`), pinned by
   `Cargo.lock` for the binary.
 

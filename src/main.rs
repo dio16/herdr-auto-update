@@ -2,8 +2,10 @@
 // and reinstall them. Runs as a herdr plugin (startup hook + actions) and as a
 // standalone CLI.
 
+mod compare;
 mod config;
 mod registry;
+mod state;
 mod updater;
 
 use std::process::ExitCode;
@@ -12,7 +14,7 @@ const USAGE: &str = "\
 herdr-auto-update - check/update installed herdr plugins
 
 USAGE:
-    herdr-auto-update <startup|check|plan|apply|update> [--json] [--config <path>] [--only <plugin_id>]
+    herdr-auto-update <startup|check|plan|apply|update|history|rollback> [--json] [--config <path>] [--only <plugin_id>]
 
 COMMANDS:
     startup   check and reinstall outdated plugins (used by herdr's startup hook)
@@ -20,11 +22,13 @@ COMMANDS:
     plan      analyze only: print status/policy/action per plugin, install nothing
     apply     execute the plan: install every plugin whose action is UPDATE
     update    check and reinstall all outdated plugins (plan + apply)
+    history   print the recorded update/rollback trail from state.json
+    rollback  reinstall plugins from the commit recorded before their last update
 
 FLAGS:
-    --json           machine-readable output (check/plan/apply/update)
+    --json           machine-readable output (check/plan/apply/update/history/rollback)
     --config <path>  override the plugin config file
-    --only <id>      restrict plan/apply/update to one plugin id
+    --only <id>      restrict plan/apply/update/rollback to one plugin id
     -V, --version    print version
     -h, --help       print help
 
@@ -94,6 +98,15 @@ fn main() -> ExitCode {
         "check" => updater::run_check(&cfg, json, only.as_deref()),
         "plan" => updater::run_plan(&cfg, json, only.as_deref()),
         "apply" | "update" => updater::run_apply(&cfg, json, only.as_deref()),
+        "history" => {
+            if only.is_some() {
+                eprintln!("error: --only cannot be used with history");
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+            updater::run_history(&cfg, json)
+        }
+        "rollback" => updater::run_rollback(&cfg, json, only.as_deref()),
         other => {
             eprintln!("error: unknown command '{other}'");
             eprintln!("{USAGE}");

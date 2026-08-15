@@ -41,6 +41,17 @@ pub struct Config {
     /// (e.g. `["ragamo/*", "*/herdr-file-viewer"]`). Empty = all GitHub
     /// plugins.
     pub allow: Vec<String>,
+    /// Only fast-forward updates are installed. Enforced by classification:
+    /// only `behind` (installed commit is an ancestor of the upstream ref)
+    /// is ever auto-applied; `ahead` and `diverged` are held.
+    pub require_fast_forward: bool,
+    /// Allow installing a diverged upstream (force-pushed history). Default
+    /// false: diverged is held. Fast-forward protection is unaffected.
+    pub allow_force_push: bool,
+    /// Path of the loaded config file (set by `load`; absent for defaults).
+    /// Parents state.json / compare-cache.json resolution.
+    #[serde(skip)]
+    pub config_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -53,6 +64,9 @@ impl Default for Config {
             max_concurrency: 8,
             policy: Policy::Auto,
             allow: Vec::new(),
+            require_fast_forward: true,
+            allow_force_push: false,
+            config_path: None,
         }
     }
 }
@@ -115,7 +129,23 @@ pub fn load(override_path: Option<&str>) -> Result<Config, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
     };
-    toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", path.display()))
+    let mut cfg: Config =
+        toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+    cfg.config_path = Some(path);
+    Ok(cfg)
+}
+
+impl Config {
+    /// Directory for the plugin's own data files (state.json, compare
+    /// cache): the loaded config file's parent, else the env-derived config
+    /// dir. `None` when no config location is known (rollback/history then
+    /// report "no state available").
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.config_path {
+            return p.parent().map(|d| d.to_path_buf());
+        }
+        config_dir(None)
+    }
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -127,6 +157,27 @@ fn default_path() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("HERDR_PLUGIN_ROOT") {
         if !root.trim().is_empty() {
             return Some(PathBuf::from(root).join("config").join("config.toml"));
+        }
+    }
+    None
+}
+
+/// Directory for plugin-owned data files (`state.json`, `compare-cache.json`).
+/// Mirrors `default_path`: the `--config` file's parent, else
+/// `HERDR_PLUGIN_CONFIG_DIR`, else `HERDR_PLUGIN_ROOT/config`. `None` when
+/// nothing is resolvable — callers then skip file writes (stateless mode).
+pub fn config_dir(override_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = override_path {
+        return PathBuf::from(p).parent().map(|d| d.to_path_buf());
+    }
+    if let Ok(dir) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    if let Ok(root) = std::env::var("HERDR_PLUGIN_ROOT") {
+        if !root.trim().is_empty() {
+            return Some(PathBuf::from(root).join("config"));
         }
     }
     None
@@ -146,6 +197,8 @@ mod tests {
         assert_eq!(cfg.max_concurrency, 8);
         assert_eq!(cfg.policy, Policy::Auto);
         assert!(cfg.allow.is_empty());
+        assert!(cfg.require_fast_forward);
+        assert!(!cfg.allow_force_push);
     }
 
     #[test]
@@ -155,7 +208,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\ntimeout_secs = 5\nmax_concurrency = 2\npolicy = \"pinned-only\"\nallow = [\"ragamo/*\"]\n",
+            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\ntimeout_secs = 5\nmax_concurrency = 2\npolicy = \"pinned-only\"\nallow = [\"ragamo/*\"]\nrequire_fast_forward = false\nallow_force_push = true\n",
         )
         .unwrap();
         let cfg = load(Some(path.to_str().unwrap())).unwrap();
@@ -169,6 +222,18 @@ mod tests {
         assert_eq!(cfg.policy, Policy::PinnedOnly);
         assert!(cfg.is_allowed("ragamo", "herdr-flock"));
         assert!(!cfg.is_allowed("dio16", "herdr-flock"));
+        assert!(!cfg.require_fast_forward);
+        assert!(cfg.allow_force_push);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_dir_resolves() {
+        let dir = std::env::temp_dir().join(format!("hau-cfgdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert_eq!(config_dir(Some(path.to_str().unwrap())), Some(dir.clone()));
+        assert_eq!(config_dir(None), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

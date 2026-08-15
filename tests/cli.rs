@@ -89,6 +89,17 @@ if \"%1\"==\"notification\" if \"%2\"==\"show\" (\r\n\
 )\r\n\
 exit /b 1\r\n";
 
+/// Compare-API stub: every sha mismatch is "ahead" (remote ahead of
+/// installed -> fast-forwardable). Individual tests override this file to
+/// simulate diverged/ahead verdicts.
+const STUB_CURL_SH: &str = r#"#!/bin/sh
+echo '{"status":"ahead","ahead_by":1,"behind_by":0,"total_commits":1}'
+"#;
+
+const STUB_CURL_CMD: &str = "@echo off\r\n\
+echo {\"status\":\"ahead\",\"ahead_by\":1,\"behind_by\":0,\"total_commits\":1}\r\n\
+exit /b 0\r\n";
+
 fn setup(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("hau-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -98,9 +109,11 @@ fn setup(name: &str) -> PathBuf {
     if cfg!(windows) {
         std::fs::write(dir.join("stub-git.cmd"), STUB_GIT_CMD).unwrap();
         std::fs::write(dir.join("stub-herdr.cmd"), STUB_HERDR_CMD).unwrap();
+        std::fs::write(dir.join("stub-curl.cmd"), STUB_CURL_CMD).unwrap();
     } else {
         std::fs::write(dir.join("stub-git.sh"), STUB_GIT_SH).unwrap();
         std::fs::write(dir.join("stub-herdr.sh"), STUB_HERDR_SH).unwrap();
+        std::fs::write(dir.join("stub-curl.sh"), STUB_CURL_SH).unwrap();
     }
     #[cfg(unix)]
     {
@@ -112,6 +125,11 @@ fn setup(name: &str) -> PathBuf {
         .unwrap();
         std::fs::set_permissions(
             dir.join("stub-herdr.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            dir.join("stub-curl.sh"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
@@ -132,11 +150,18 @@ fn run(dir: &Path, args: &[&str], config: Option<&Path>) -> Output {
     } else {
         dir.join("stub-herdr.sh")
     };
+    let stub_curl = dir.join("stub-curl.cmd");
+    let stub_curl = if stub_curl.exists() {
+        stub_curl
+    } else {
+        dir.join("stub-curl.sh")
+    };
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-auto-update"));
     cmd.args(args)
         .env("HERDR_BIN_PATH", &stub_herdr)
         .env("HERDR_AUTO_UPDATE_GIT", &stub_git)
+        .env("HERDR_AUTO_UPDATE_CURL", &stub_curl)
         .env_remove("HERDR_PLUGIN_CONFIG_DIR")
         .env_remove("HERDR_PLUGIN_ROOT");
     if let Some(cfg) = config {
@@ -599,7 +624,7 @@ fn plan_reports_actions_without_installing() {
     assert!(s.contains("herdr-file-viewer"), "{s}");
     assert!(s.contains("action: UPDATE"), "{s}");
     assert!(s.contains("action: HOLD"), "{s}");
-    assert!(s.contains("status: changed"), "{s}");
+    assert!(s.contains("status: behind"), "{s}");
     // Plan never installs.
     assert_eq!(installs(&dir), "", "plan must not reinstall anything");
 }
@@ -620,7 +645,7 @@ fn plan_json_includes_status_and_action() {
     let out = run(&dir, &["plan", "--json"], None);
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
-    assert!(s.contains("\"status\": \"changed\""), "{s}");
+    assert!(s.contains("\"status\": \"behind\""), "{s}");
     assert!(s.contains("\"status\": \"same\""), "{s}");
     assert!(s.contains("\"action\": \"update\""), "{s}");
     assert!(s.contains("\"policy\": \"auto\""), "{s}");
@@ -637,7 +662,7 @@ fn check_json_includes_status_field() {
     let out = run(&dir, &["check", "--json"], None);
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
-    assert!(s.contains("\"status\": \"changed\""), "{s}");
+    assert!(s.contains("\"status\": \"behind\""), "{s}");
     assert!(s.contains("\"status\": \"same\""), "{s}");
     assert!(s.contains("\"status\": \"unknown\""), "{s}");
 }
@@ -701,4 +726,125 @@ fn apply_acts_like_update() {
     assert!(log.contains("ragamo/herdr-flock"), "{log}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("2 updated, 0 failed"), "{err}");
+}
+
+#[test]
+fn diverged_is_held_by_default() {
+    let dir = setup("diverged-held");
+    // Override the compare stub: diverged history (force push) for every repo.
+    let stub = dir.join("stub-curl.sh");
+    if stub.exists() {
+        std::fs::write(&stub, "#!/bin/sh\necho '{\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":2}'\n").unwrap();
+    } else {
+        std::fs::write(
+            dir.join("stub-curl.cmd"),
+            "@echo off\r\necho {\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":2}\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+    }
+    let out = run(&dir, &["update"], None);
+    // REGISTRY has check errors -> 2; herdr-file-viewer must NOT be installed.
+    assert_eq!(out.status.code(), Some(2));
+    let log = installs(&dir);
+    assert!(
+        !log.contains("smarzban/herdr-file-viewer"),
+        "diverged must not install by default: {log}"
+    );
+    let s = stdout_of(&out);
+    assert!(s.contains("diverged"), "{s}");
+}
+
+#[test]
+fn diverged_installs_with_allow_force_push() {
+    let dir = setup("diverged-force");
+    let stub = dir.join("stub-curl.sh");
+    if stub.exists() {
+        std::fs::write(&stub, "#!/bin/sh\necho '{\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":2}'\n").unwrap();
+    } else {
+        std::fs::write(
+            dir.join("stub-curl.cmd"),
+            "@echo off\r\necho {\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":2}\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+    }
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "allow_force_push = true\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(2)); // errors still present in REGISTRY
+    assert!(installs(&dir).contains("smarzban/herdr-file-viewer"));
+}
+
+#[test]
+fn rate_limit_degrades_to_unknown() {
+    let dir = setup("rate-limit");
+    // curl exits 1 (rate limit / network) -> classify fails -> Unknown.
+    let stub = dir.join("stub-curl.sh");
+    if stub.exists() {
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+    } else {
+        std::fs::write(dir.join("stub-curl.cmd"), "@echo off\r\nexit /b 1\r\n").unwrap();
+    }
+    let out = run(&dir, &["check", "--json"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let s = stdout_of(&out);
+    assert!(s.contains("\"status\": \"unknown\""), "{s}");
+    assert!(s.contains("request failed"), "{s}");
+}
+
+#[test]
+fn rollback_reinstalls_previous_commit() {
+    let dir = setup("rollback");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    let prev = "350f3f5be79d136933ba36c8c8dd60f79df28002";
+    let cur = "71d4c1c3706e7958c714789b035a99d949620a9e";
+    std::fs::write(
+        dir.join("state.json"),
+        format!(
+            r#"{{"version":1,"entries":[{{"plugin_id":"herdr-file-viewer","previous_sha":"{prev}","current_sha":"{cur}","updated_at":"2026-08-15T00:00:00Z","result":"updated"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let out = run(&dir, &["rollback"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let log = installs(&dir);
+    assert!(
+        log.contains(&format!("smarzban/herdr-file-viewer --ref {prev} --yes")),
+        "rollback must reinstall the previous commit: {log}"
+    );
+    let s = stdout_of(&out);
+    assert!(s.contains("rolling back"), "{s}");
+}
+
+#[test]
+fn update_records_state_history() {
+    let dir = setup("state-record");
+    write_registry(&dir, CLEAN_REGISTRY);
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0)); // no errors in CLEAN_REGISTRY
+    let st = std::fs::read_to_string(dir.join("state.json")).unwrap_or_default();
+    assert!(st.contains("\"herdr-file-viewer\""), "{st}");
+    assert!(st.contains("\"result\": \"updated\""), "{st}");
+    assert!(
+        st.contains("\"previous_sha\": \"350f3f5be79d136933ba36c8c8dd60f79df28002\""),
+        "{st}"
+    );
+}
+
+#[test]
+fn history_prints_recorded_updates() {
+    let dir = setup("history");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"version":1,"entries":[{"plugin_id":"herdr-file-viewer","previous_sha":"350f3f5be79d136933ba36c8c8dd60f79df28002","current_sha":"71d4c1c3706e7958c714789b035a99d949620a9e","updated_at":"2026-08-15T00:00:00Z","result":"updated"}]}"#,
+    )
+    .unwrap();
+    let out = run(&dir, &["history"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let s = stdout_of(&out);
+    assert!(s.contains("updated herdr-file-viewer"), "{s}");
 }

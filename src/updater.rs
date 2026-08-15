@@ -2,8 +2,10 @@
 // via `git ls-remote`, then reinstall outdated ones through the herdr CLI.
 // All subprocess calls use argv arrays - no shell interpolation anywhere.
 
+use crate::compare;
 use crate::config::{Config, Policy};
 use crate::registry;
+use crate::state;
 use serde::Serialize;
 use std::io::Read;
 use std::process::{Child, Command, ExitCode, Output, Stdio};
@@ -19,14 +21,18 @@ const GIT_TIMEOUT_ARGS: [&str; 4] = ["-c", "http.lowSpeedLimit=1", "-c", "http.l
 
 /// Classification of a plugin relative to its upstream ref (v0.2 granularity).
 /// `unknown` covers check errors and non-GitHub entries; v0.3 refines
-/// `changed` into `behind`/`ahead`/`diverged` via the compare API.
+/// Classification of a plugin's installed commit vs upstream (compare API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
     /// Upstream ref matches the installed commit.
     Same,
-    /// Upstream ref differs from the installed commit.
-    Changed,
+    /// Installed is behind upstream (remote has newer commits) - updateable.
+    Behind,
+    /// Local is ahead of upstream (upstream was reset/force-pushed away).
+    Ahead,
+    /// Both sides have unique commits (force push etc.) - not a fast-forward.
+    Diverged,
     /// Remote could not be resolved (network error, invalid entry, skipped kind).
     Unknown,
 }
@@ -246,6 +252,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 }
                 if apply_update(&e.owner, &e.repo, e.requested_ref.as_deref()) {
                     updated.push(e.plugin_id.clone());
+                    record_update(cfg, e);
                 } else {
                     failed.push(e.plugin_id.clone());
                 }
@@ -316,8 +323,25 @@ fn decide(cfg: &Config, s: &PluginStatus) -> (Action, Option<String>) {
     if let Some(err) = &s.error {
         return (Action::Error, Some(err.clone()));
     }
-    if !s.update_available {
-        return (Action::Hold, Some("up to date".to_string()));
+    // Only fast-forwardable updates (Behind) are ever applied. Same / ahead /
+    // diverged / unknown never update - installing them could lose commits.
+    let why = match s.status {
+        Status::Same => Some("up to date".to_string()),
+        Status::Ahead => {
+            Some("installed commit is ahead of upstream (upstream reset?)".to_string())
+        }
+        Status::Unknown => Some("cannot classify update (network / rate limit?)".to_string()),
+        Status::Behind => None,
+        Status::Diverged => {
+            if cfg.allow_force_push {
+                None
+            } else {
+                Some("commits diverged (force push?); allow_force_push=false".to_string())
+            }
+        }
+    };
+    if let Some(why) = why {
+        return (Action::Hold, Some(why));
     }
     if cfg.is_excluded(&s.plugin_id) {
         return (Action::Hold, Some("excluded".to_string()));
@@ -387,6 +411,162 @@ fn apply_update(owner: &str, repo: &str, requested_ref: Option<&str>) -> bool {
             false
         }
     }
+}
+
+/// Record a successful update in state.json (§5.8), then verify herdr's
+/// registry now resolves the plugin to the new commit. Best-effort: a write
+/// failure or verify mismatch is reported, never fatal.
+fn record_update(cfg: &Config, e: &PlanEntry) {
+    let Some(dir) = cfg.data_dir() else { return };
+    let mut st = state::State::load(&dir);
+    st.append(state::StateEntry {
+        plugin_id: e.plugin_id.clone(),
+        previous_sha: e.installed_sha.clone(),
+        current_sha: e.remote_sha.clone().unwrap_or_default(),
+        requested_ref: e.requested_ref.clone(),
+        updated_at: state::rfc3339_now(),
+        result: "updated".to_string(),
+    });
+    if let Err(err) = st.save(&dir) {
+        eprintln!("  warning: {err}");
+        return;
+    }
+    if let Some(expected) = &e.remote_sha {
+        match verify_installed(&e.plugin_id, expected) {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "  [{}] warning: verify failed - registry still reports the old commit",
+                e.plugin_id
+            ),
+            Err(err) => eprintln!("  [{}] warning: verify error: {err}", e.plugin_id),
+        }
+    }
+}
+
+/// Confirm herdr's registry resolves `plugin_id` to `expected` (the commit we
+/// just installed). Uses the same registry path as `check`, so a stale
+/// registry row reads as not-verified.
+fn verify_installed(plugin_id: &str, expected: &str) -> Result<bool, String> {
+    let plugins = registry::list_installed()?;
+    Ok(plugins
+        .iter()
+        .find(|p| p.plugin_id == plugin_id)
+        .and_then(|p| p.source.as_ref())
+        .and_then(|s| s.resolved_commit.as_deref())
+        .map(|sha| sha == expected)
+        .unwrap_or(false))
+}
+
+/// `rollback`: reinstall a plugin from the commit recorded before its last
+/// update. Relies on herdr accepting a commit SHA via `--ref` (§8 risk).
+pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    let Some(dir) = cfg.data_dir() else {
+        eprintln!("error: no config dir; cannot locate state.json");
+        return ExitCode::from(2);
+    };
+    let st = state::State::load(&dir);
+    if st.entries.is_empty() {
+        if !json {
+            eprintln!("[herdr-auto-update] no updates recorded - nothing to roll back");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let targets: Vec<&state::StateEntry> = match only {
+        Some(id) => match st.latest_for(id) {
+            Some(e) if e.result == "updated" => vec![e],
+            _ => {
+                eprintln!("error: no update recorded for plugin '{id}'");
+                return ExitCode::from(2);
+            }
+        },
+        None => st
+            .entries
+            .iter()
+            .rev()
+            .filter(|e| e.result == "updated")
+            .collect(),
+    };
+
+    let mut rolled_back: Vec<&str> = Vec::new();
+    for e in targets {
+        if e.previous_sha.is_empty() {
+            eprintln!(
+                "  [{}] cannot roll back: no previous commit recorded",
+                e.plugin_id
+            );
+            continue;
+        }
+        let Some((owner, repo)) = owner_repo_of(&e.plugin_id) else {
+            eprintln!(
+                "  [{}] cannot roll back: plugin not in registry",
+                e.plugin_id
+            );
+            continue;
+        };
+        if !json {
+            println!(
+                "  [{}] rolling back {} -> {}",
+                e.plugin_id,
+                short(&e.current_sha),
+                short(&e.previous_sha)
+            );
+        }
+        if apply_update(&owner, &repo, Some(&e.previous_sha)) {
+            rolled_back.push(&e.plugin_id);
+        }
+    }
+    if !json {
+        eprintln!(
+            "[herdr-auto-update] {} plugin(s) rolled back",
+            rolled_back.len()
+        );
+    }
+    if rolled_back.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `history`: print the recorded update/rollback trail from state.json.
+pub fn run_history(cfg: &Config, json: bool) -> ExitCode {
+    let Some(dir) = cfg.data_dir() else {
+        eprintln!("error: no config dir; cannot locate state.json");
+        return ExitCode::from(2);
+    };
+    let st = state::State::load(&dir);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st.entries).unwrap());
+        return ExitCode::SUCCESS;
+    }
+    if st.entries.is_empty() {
+        println!("[herdr-auto-update] no recorded updates");
+        return ExitCode::SUCCESS;
+    }
+    for e in &st.entries {
+        println!(
+            "{} {} {} {} -> {}",
+            e.updated_at,
+            e.result,
+            e.plugin_id,
+            short(&e.previous_sha),
+            short(&e.current_sha)
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Resolve a plugin id to its owner/repo from the current herdr registry.
+fn owner_repo_of(plugin_id: &str) -> Option<(String, String)> {
+    let plugins = registry::list_installed().ok()?;
+    plugins
+        .iter()
+        .find(|p| p.plugin_id == plugin_id)
+        .and_then(|p| {
+            let s = p.source.as_ref()?;
+            Some((s.owner.clone()?, s.repo.clone()?))
+        })
 }
 
 /// A plugin whose remote commit still needs resolving (network call).
@@ -485,16 +665,22 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
         }
     }
 
-    // Worker pool: at most `max_concurrency` git processes at once. A
+    // Worker pool: at most `max_concurrency` git/curl processes at once. A
     // registry full of plugins must not spawn an unbounded number of
     // processes, and a slow network must not serialize all checks.
     let workers = jobs.len().min(cfg.max_concurrency.max(1));
     let timeout_secs = cfg.timeout_secs;
+    let config_dir = cfg.data_dir();
+    let cache = config_dir
+        .as_deref()
+        .map(compare::load_cache)
+        .unwrap_or_default();
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let next = &next;
         let jobs = &jobs;
-        let (res_tx, res_rx) = mpsc::channel::<(usize, Result<Option<String>, String>)>();
+        let cache = &cache;
+        let (res_tx, res_rx) = mpsc::channel::<(usize, JobResult)>();
         for _ in 0..workers {
             let res_tx = res_tx.clone();
             scope.spawn(move || {
@@ -504,12 +690,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                         break;
                     }
                     let job = &jobs[i];
-                    let result = remote_head(
-                        &job.owner,
-                        &job.repo,
-                        job.requested_ref.as_deref(),
-                        timeout_secs,
-                    );
+                    let result = resolve_job(job, timeout_secs, cache);
                     // Workers only exit after every job index is claimed, and
                     // the collector only exits after every result arrives.
                     res_tx.send((i, result)).expect("result channel closed");
@@ -517,56 +698,133 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
             });
         }
         drop(res_tx);
+        let mut fresh_entries: Vec<compare::CacheEntry> = Vec::new();
         for _ in 0..jobs.len() {
             let (index, result) = res_rx.recv().expect("all workers exited early");
             let job = &jobs[index];
-            let status = match result {
-                Ok(Some(sha)) => PluginStatus {
-                    plugin_id: job.plugin_id.clone(),
-                    owner: job.owner.clone(),
-                    repo: job.repo.clone(),
-                    version: job.version.clone(),
-                    installed_sha: job.installed_sha.clone(),
-                    remote_sha: Some(sha.clone()),
-                    update_available: sha != job.installed_sha,
-                    status: if sha == job.installed_sha {
-                        Status::Same
-                    } else {
-                        Status::Changed
-                    },
-                    requested_ref: job.requested_ref.clone(),
-                    error: None,
-                },
-                Ok(None) => PluginStatus {
-                    plugin_id: job.plugin_id.clone(),
-                    owner: job.owner.clone(),
-                    repo: job.repo.clone(),
-                    version: job.version.clone(),
-                    installed_sha: job.installed_sha.clone(),
-                    remote_sha: None,
-                    update_available: false,
-                    status: Status::Unknown,
-                    requested_ref: job.requested_ref.clone(),
-                    error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
-                },
-                Err(e) => PluginStatus {
-                    plugin_id: job.plugin_id.clone(),
-                    owner: job.owner.clone(),
-                    repo: job.repo.clone(),
-                    version: job.version.clone(),
-                    installed_sha: job.installed_sha.clone(),
-                    remote_sha: None,
-                    update_available: false,
-                    status: Status::Unknown,
-                    requested_ref: job.requested_ref.clone(),
-                    error: Some(e),
-                },
+            fresh_entries.extend(result.cache_entries.clone());
+            let status = PluginStatus {
+                plugin_id: job.plugin_id.clone(),
+                owner: job.owner.clone(),
+                repo: job.repo.clone(),
+                version: job.version.clone(),
+                installed_sha: job.installed_sha.clone(),
+                remote_sha: result.remote_sha,
+                update_available: result.status == Status::Behind,
+                status: result.status,
+                requested_ref: job.requested_ref.clone(),
+                error: result.error,
             };
             statuses[job.index] = Some(status);
+        }
+        if let Some(dir) = config_dir.as_deref() {
+            compare::merge_cache(dir, fresh_entries);
         }
     });
 
     Ok(statuses.into_iter().flatten().collect())
+}
+
+/// Result of resolving one plugin's remote state (ls-remote + compare API).
+struct JobResult {
+    remote_sha: Option<String>,
+    status: Status,
+    error: Option<String>,
+    cache_entries: Vec<compare::CacheEntry>,
+}
+
+/// Resolve a plugin's remote commit and classify it against the installed
+/// commit. API failures degrade to `Unknown` (safe side: no update); the
+/// cache keeps rate-limited repos retryable next run.
+fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> JobResult {
+    let remote = match remote_head(
+        &job.owner,
+        &job.repo,
+        job.requested_ref.as_deref(),
+        timeout_secs,
+    ) {
+        Ok(Some(sha)) => sha,
+        Ok(None) => {
+            return JobResult {
+                remote_sha: None,
+                status: Status::Unknown,
+                error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
+                cache_entries: Vec::new(),
+            }
+        }
+        Err(e) => {
+            return JobResult {
+                remote_sha: None,
+                status: Status::Unknown,
+                error: Some(e),
+                cache_entries: Vec::new(),
+            }
+        }
+    };
+    if remote == job.installed_sha {
+        return JobResult {
+            remote_sha: Some(remote),
+            status: Status::Same,
+            error: None,
+            cache_entries: Vec::new(),
+        };
+    }
+    // Ref changed: classify via the compare API (cached). Failure degrades
+    // to Unknown - we cannot prove it is a fast-forward, so no update.
+    match compare::classify(
+        &job.owner,
+        &job.repo,
+        &job.installed_sha,
+        &remote,
+        timeout_secs,
+        cache,
+    ) {
+        Ok(compare::CompareStatus::Identical) => JobResult {
+            remote_sha: Some(remote),
+            status: Status::Same,
+            error: None,
+            cache_entries: Vec::new(),
+        },
+        Ok(compare::CompareStatus::Ahead) => JobResult {
+            remote_sha: Some(remote.clone()),
+            status: Status::Behind,
+            error: None,
+            cache_entries: cache_entry(job, &remote, compare::CompareStatus::Ahead),
+        },
+        Ok(compare::CompareStatus::Behind) => JobResult {
+            remote_sha: Some(remote.clone()),
+            status: Status::Ahead,
+            error: None,
+            cache_entries: cache_entry(job, &remote, compare::CompareStatus::Behind),
+        },
+        Ok(compare::CompareStatus::Diverged) => JobResult {
+            remote_sha: Some(remote.clone()),
+            status: Status::Diverged,
+            error: None,
+            cache_entries: cache_entry(job, &remote, compare::CompareStatus::Diverged),
+        },
+        Err(e) => JobResult {
+            remote_sha: Some(remote),
+            status: Status::Unknown,
+            error: Some(e),
+            cache_entries: Vec::new(),
+        },
+    }
+}
+
+fn cache_entry(
+    job: &RemoteJob,
+    remote_sha: &str,
+    status: compare::CompareStatus,
+) -> Vec<compare::CacheEntry> {
+    vec![compare::CacheEntry {
+        owner: job.owner.clone(),
+        repo: job.repo.clone(),
+        installed_sha: job.installed_sha.clone(),
+        remote_sha: remote_sha.to_string(),
+        status,
+        at: state::rfc3339_now(),
+    }]
 }
 
 /// Resolve the remote commit for a plugin: its pinned ref when
@@ -583,7 +841,7 @@ fn remote_head(
     args.push("ls-remote");
     args.push(&url);
     args.push(requested_ref.unwrap_or("HEAD"));
-    let out = run_git_with_timeout(&args, timeout_secs)?;
+    let out = run_with_timeout(&git_bin(), &args, timeout_secs)?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -602,12 +860,12 @@ fn remote_head(
     }
 }
 
-/// Run `git` with a wall-clock deadline. `timeout_secs == 0` disables the
-/// deadline. The child's stdout/stderr are read to completion so the pipe
-/// buffer cannot fill up and stall the child past the deadline; a timed-out
-/// process is killed and reaped before we return.
-fn run_git_with_timeout(args: &[&str], timeout_secs: u64) -> Result<Output, String> {
-    let mut child = Command::new(git_bin())
+/// Run an external binary with a wall-clock deadline. `timeout_secs == 0`
+/// disables the deadline. The child's stdout/stderr are read to completion
+/// so the pipe buffer cannot fill up and stall the child past the deadline;
+/// a timed-out process is killed and reaped before we return.
+pub fn run_with_timeout(bin: &str, args: &[&str], timeout_secs: u64) -> Result<Output, String> {
+    let mut child = Command::new(bin)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -689,26 +947,46 @@ fn git_bin() -> String {
 fn print_status(s: &PluginStatus) {
     if let Some(err) = &s.error {
         println!("  [{}] error: {err}", s.plugin_id);
-    } else if s.update_available {
-        println!(
+        return;
+    }
+    match s.status {
+        Status::Behind => println!(
             "  [{}] update available: {} -> {}",
             s.plugin_id,
             short(&s.installed_sha),
             short(s.remote_sha.as_deref().unwrap_or("?"))
-        );
-    } else {
-        println!(
+        ),
+        Status::Ahead => println!(
+            "  [{}] ahead of upstream ({} -> {})",
+            s.plugin_id,
+            short(&s.installed_sha),
+            short(s.remote_sha.as_deref().unwrap_or("?"))
+        ),
+        Status::Diverged => println!(
+            "  [{}] diverged from upstream ({} -> {})",
+            s.plugin_id,
+            short(&s.installed_sha),
+            short(s.remote_sha.as_deref().unwrap_or("?"))
+        ),
+        Status::Unknown => println!(
+            "  [{}] unknown ({} -> ?)",
+            s.plugin_id,
+            short(&s.installed_sha)
+        ),
+        Status::Same => println!(
             "  [{}] up to date ({})",
             s.plugin_id,
             short(&s.installed_sha)
-        );
+        ),
     }
 }
 
 fn status_label(s: Status) -> &'static str {
     match s {
         Status::Same => "same",
-        Status::Changed => "changed",
+        Status::Behind => "behind",
+        Status::Ahead => "ahead",
+        Status::Diverged => "diverged",
         Status::Unknown => "unknown",
     }
 }
