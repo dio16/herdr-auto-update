@@ -48,6 +48,14 @@ pub struct Config {
     /// Allow installing a diverged upstream (force-pushed history). Default
     /// false: diverged is held. Fast-forward protection is unaffected.
     pub allow_force_push: bool,
+    /// Only auto-update plugins whose owner is in this list (e.g.
+    /// `["dio16", "ragamo"]`). Empty = no owner restriction. Untrusted
+    /// owners are held even when `policy = "auto"`.
+    pub trusted_owners: Vec<String>,
+    /// Never auto-update plugins pinned to a tag or commit SHA: an immutable
+    /// pin is only changed by an explicit reinstall/rollback, never by
+    /// `update`/`startup`.
+    pub immutable_pins: bool,
     /// Path of the loaded config file (set by `load`; absent for defaults).
     /// Parents state.json / compare-cache.json resolution.
     #[serde(skip)]
@@ -66,6 +74,8 @@ impl Default for Config {
             allow: Vec::new(),
             require_fast_forward: true,
             allow_force_push: false,
+            trusted_owners: Vec::new(),
+            immutable_pins: true,
             config_path: None,
         }
     }

@@ -106,6 +106,8 @@ max_concurrency = 8
 #   "auto"        - reinstall outdated plugins (current behavior)
 #   "notify"      - check, report, and notify only; never install
 #   "pinned-only" - reinstall only plugins installed with a pinned --ref
+# NOTE: the default will change from "auto" to "notify" in v1.0; the binary
+# prints a stderr note while policy stays unset.
 policy = "auto"
 
 # Restrict update targets to owner/repo glob patterns (default: all GitHub
@@ -120,6 +122,14 @@ require_fast_forward = true
 # Allow installing a diverged upstream (history rewritten by a force push).
 # Default false: diverged plugins are held until you decide.
 allow_force_push = false
+
+# Only auto-update plugins whose GitHub owner is in this list (default:
+# empty = any owner). Use to whitelist trusted plugin authors.
+# trusted_owners = ["dio16", "ragamo"]
+
+# Hold tag- and commit-pinned plugins (default true): their pin is treated as
+# immutable, so only branch-tracked plugins are ever auto-updated.
+# immutable_pins = true
 ```
 
 ## CLI

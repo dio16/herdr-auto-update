@@ -107,4 +107,4 @@ jobs:
           files: |
             assets/herdr-auto-update-*.tar.gz
             assets/checksums-*.txt
-          overwrite: true
+          overwrite_files: true

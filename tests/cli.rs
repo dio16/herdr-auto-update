@@ -914,3 +914,97 @@ fn commit_pin_skips_network_and_never_updates() {
     assert!(s.contains("commit.pinned"), "{s}");
     assert!(s.contains("up to date"), "{s}");
 }
+
+#[test]
+fn trusted_owners_holds_untrusted_owners() {
+    let dir = setup("trusted-owners");
+    write_registry(&dir, CLEAN_REGISTRY);
+    let cfg = dir.join("config.toml");
+    // herdr-file-viewer is smarzban/...; only ragamo is trusted.
+    std::fs::write(&cfg, "trusted_owners = [\"ragamo\"]\n").unwrap();
+    let out = run(&dir, &["update"], Some(&cfg));
+    // CLEAN_REGISTRY has 2 updates (file-viewer, pinned.old); file-viewer held.
+    let log = installs(&dir);
+    assert!(
+        !log.contains("smarzban"),
+        "untrusted owner must not install: {log}"
+    );
+    assert!(
+        log.contains("ragamo/herdr-flock"),
+        "trusted owner may install: {log}"
+    );
+    let s = stdout_of(&out);
+    assert!(s.contains("owner 'smarzban' not trusted"), "{s}");
+}
+
+#[test]
+fn immutable_pins_hold_tag_and_commit() {
+    let dir = setup("immutable-pins");
+    write_registry(&dir, PINNED_REGISTRY);
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "immutable_pins = true\n").unwrap();
+    let out = run(&dir, &["plan"], Some(&cfg));
+    let s = stdout_of(&out);
+    assert!(s.contains("tag.pinned"), "{s}");
+    assert!(s.contains("immutable pin (tag)"), "{s}");
+    assert!(s.contains("commit.pinned"), "{s}");
+    // commit.pinned is same-status (pin IS the commit) -> HOLD via up-to-date.
+    let lines: Vec<&str> = s.lines().collect();
+    let cidx = lines
+        .iter()
+        .position(|l| l.contains("commit.pinned"))
+        .unwrap();
+    let cblock = lines[cidx..]
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(cblock.contains("action: HOLD"), "{cblock}");
+    assert!(!cblock.contains("action: UPDATE"), "{cblock}");
+    // flock.farm (branch/default) is not held by the pin rule.
+    let fidx = lines.iter().position(|l| l.contains("flock.farm")).unwrap();
+    let fblock = lines[fidx..]
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!fblock.contains("immutable pin"), "{fblock}");
+}
+
+#[test]
+fn commit_pin_is_never_updateable() {
+    let dir = setup("commit-pin-immutable-off");
+    write_registry(&dir, PINNED_REGISTRY);
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "immutable_pins = false\n").unwrap();
+    let out = run(&dir, &["plan"], Some(&cfg));
+    let s = stdout_of(&out);
+    // commit.pinned: pin IS the commit -> same, never UPDATE even without immutable_pins.
+    let block: Vec<&str> = s.lines().collect();
+    let idx = block
+        .iter()
+        .position(|l| l.contains("commit.pinned"))
+        .unwrap();
+    let joined: Vec<&str> = block[idx..].iter().take(8).copied().collect();
+    let joined = joined.join("\n");
+    assert!(joined.contains("status: same"), "{joined}");
+    assert!(joined.contains("action: HOLD"), "{joined}");
+}
+
+#[test]
+fn auto_policy_emits_migration_warning() {
+    let dir = setup("migration-warning");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap(); // policy unset -> auto
+    let out = run(&dir, &["update"], Some(&cfg));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("v1.0 will default to \"notify\""), "{e}");
+    // Explicit policy silences the warning.
+    let cfg2 = dir.join("config2.toml");
+    std::fs::write(&cfg2, "policy = \"notify\"\n").unwrap();
+    let out2 = run(&dir, &["update"], Some(&cfg2));
+    let e2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(!e2.contains("v1.0 will default"), "{e2}");
+}

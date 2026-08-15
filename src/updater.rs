@@ -214,6 +214,13 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     };
     let plan = build_plan(cfg, &statuses);
 
+    if !json && cfg.policy == Policy::Auto {
+        eprintln!(
+            "[herdr-auto-update] note: policy=\"auto\" is the current default; v1.0 will default \
+             to \"notify\". Set policy explicitly to keep behavior stable."
+        );
+    }
+
     let mut updated: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut excluded: Vec<String> = Vec::new();
@@ -376,6 +383,21 @@ fn decide(cfg: &Config, s: &PluginStatus) -> (Action, Option<String>) {
     }
     if !cfg.is_allowed(&s.owner, &s.repo) {
         return (Action::Hold, Some("not in allow list".to_string()));
+    }
+    if !cfg.trusted_owners.is_empty() && !cfg.trusted_owners.iter().any(|o| o == &s.owner) {
+        return (
+            Action::Hold,
+            Some(format!("owner '{}' not trusted", s.owner)),
+        );
+    }
+    if cfg.immutable_pins && s.ref_kind != RefKind::Branch {
+        return (
+            Action::Hold,
+            Some(format!(
+                "immutable pin ({}); not auto-updated",
+                ref_kind_label(s.ref_kind)
+            )),
+        );
     }
     match cfg.policy {
         Policy::Notify => (Action::Hold, Some("policy: notify".to_string())),
