@@ -14,6 +14,12 @@ pub struct Config {
     pub notify: bool,
     /// Plugin ids to skip during updates.
     pub exclude: Vec<String>,
+    /// Wall-clock deadline (seconds) for one remote check (`git ls-remote`).
+    /// Kills the git process so a wedged connection cannot hang forever.
+    pub timeout_secs: u64,
+    /// Upper bound on concurrent remote checks. Bounded so a registry full of
+    /// plugins cannot spawn an unbounded number of git processes.
+    pub max_concurrency: usize,
 }
 
 impl Default for Config {
@@ -22,6 +28,8 @@ impl Default for Config {
             auto_update: true,
             notify: true,
             exclude: Vec::new(),
+            timeout_secs: 20,
+            max_concurrency: 8,
         }
     }
 }
@@ -70,6 +78,8 @@ mod tests {
         assert!(cfg.auto_update);
         assert!(cfg.notify);
         assert!(cfg.exclude.is_empty());
+        assert_eq!(cfg.timeout_secs, 20);
+        assert_eq!(cfg.max_concurrency, 8);
     }
 
     #[test]
@@ -79,7 +89,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\n",
+            "auto_update = false\nnotify = false\nexclude = [\"flock.farm\", \"wave-tui.radio\"]\ntimeout_secs = 5\nmax_concurrency = 2\n",
         )
         .unwrap();
         let cfg = load(Some(path.to_str().unwrap())).unwrap();
@@ -88,6 +98,8 @@ mod tests {
         assert_eq!(cfg.exclude, vec!["flock.farm", "wave-tui.radio"]);
         assert!(cfg.is_excluded("flock.farm"));
         assert!(!cfg.is_excluded("other"));
+        assert_eq!(cfg.timeout_secs, 5);
+        assert_eq!(cfg.max_concurrency, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

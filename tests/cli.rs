@@ -161,6 +161,12 @@ fn write_registry(dir: &Path, registry: &str) {
     std::fs::write(dir.join("registry.json"), registry).unwrap();
 }
 
+/// Single github plugin whose stub git hangs forever; used by the
+/// hard-timeout test so only one git process is involved.
+const SLOW_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
+  {"plugin_id":"slow.repo","version":"0.1.0","source":{"kind":"github","owner":"example","repo":"slow-repo","resolved_commit":"0000000000000000000000000000000000000001"}}
+]}}"#;
+
 /// Registry without error entries (no unresolvable/evil plugins), used to
 /// test exit code 1 for pending updates without errors.
 const CLEAN_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[
@@ -228,9 +234,11 @@ fn check_json_includes_version_and_ref() {
 fn update_reinstalls_only_outdated_via_herdr_cli() {
     let dir = setup("update");
     let out = run(&dir, &["update"], None);
+    // REGISTRY has 3 check errors (wave-tui, broken, evil): update installs
+    // what it can and exits 2 so scripts can detect the partial check.
     assert_eq!(
         out.status.code(),
-        Some(0),
+        Some(2),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -246,7 +254,7 @@ fn update_reinstalls_only_outdated_via_herdr_cli() {
         !log.contains("plugin install ragamo/herdr-flock --yes"),
         "up-to-date plugin must not be reinstalled against HEAD: {log}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("2 updated, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("2 updated, 0 failed, 3 error(s)"));
 }
 
 #[test]
@@ -259,7 +267,7 @@ fn update_respects_exclude_list() {
     )
     .unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2)); // registry still has check errors
     let log = installs(&dir);
     assert!(
         !log.contains("herdr-file-viewer"),
@@ -282,7 +290,8 @@ fn startup_honors_auto_update_disabled() {
 fn startup_updates_by_default() {
     let dir = setup("startup-on");
     let out = run(&dir, &["startup"], None);
-    assert_eq!(out.status.code(), Some(0));
+    // startup delegates to update: check errors (3 in REGISTRY) -> exit 2.
+    assert_eq!(out.status.code(), Some(2));
     assert!(installs(&dir).contains("smarzban/herdr-file-viewer"));
 }
 
@@ -290,13 +299,17 @@ fn startup_updates_by_default() {
 fn update_json_reports_actions() {
     let dir = setup("update-json");
     let out = run(&dir, &["update", "--json"], None);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2)); // registry has check errors
     let s = stdout_of(&out);
     assert!(
         s.contains("\"updated\": [\n    \"herdr-file-viewer\""),
         "{s}"
     );
     assert!(s.contains("\"failed\": []"), "{s}");
+    // Check errors are part of the report so scripts can count them.
+    assert!(s.contains("\"errors\": [\n    \"wave-tui.radio\""), "{s}");
+    assert!(s.contains("\"broken\""), "{s}");
+    assert!(s.contains("\"evil\""), "{s}");
 }
 
 #[test]
@@ -345,7 +358,7 @@ fn update_passes_ref_flag_for_pinned_plugins() {
     let out = run(&dir, &["update"], None);
     assert_eq!(
         out.status.code(),
-        Some(0),
+        Some(2), // registry has check errors
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -366,10 +379,11 @@ fn update_passes_ref_flag_for_pinned_plugins() {
 fn update_notifies_after_updates() {
     let dir = setup("update-notify");
     let out = run(&dir, &["update"], None);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2)); // registry has check errors
     let n = notifications(&dir);
     assert!(
-        n.contains("herdr-auto-update") && n.contains("2 plugin(s) updated"),
+        n.contains("herdr-auto-update")
+            && n.contains("2 plugin(s) updated, 3 could not be checked"),
         "notification log: {n}"
     );
 }
@@ -380,7 +394,7 @@ fn update_notify_can_be_disabled() {
     let cfg = dir.join("config.toml");
     std::fs::write(&cfg, "notify = false\n").unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2)); // registry has check errors
     assert_eq!(notifications(&dir), "", "notify=false must not notify");
 }
 
@@ -390,10 +404,13 @@ fn update_notify_skipped_when_nothing_to_do() {
     let cfg = dir.join("config.toml");
     std::fs::write(&cfg, "exclude = [\"herdr-file-viewer\"]\n").unwrap();
     let out = run(&dir, &["update"], Some(&cfg));
-    assert_eq!(out.status.code(), Some(0));
-    // herdr-file-viewer excluded, pinned.old still updated -> notify fires.
+    assert_eq!(out.status.code(), Some(2)); // registry has check errors
+                                            // herdr-file-viewer excluded, pinned.old still updated -> notify fires.
     let n = notifications(&dir);
-    assert!(n.contains("1 plugin(s) updated"), "notification log: {n}");
+    assert!(
+        n.contains("1 plugin(s) updated, 3 could not be checked"),
+        "notification log: {n}"
+    );
 }
 
 #[test]
@@ -439,7 +456,7 @@ fn update_only_local_plugin_is_fatal() {
 fn update_json_does_not_notify() {
     let dir = setup("update-json-notify");
     let out = run(&dir, &["update", "--json"], None);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(2)); // registry has check errors
     assert_eq!(notifications(&dir), "", "--json must not notify");
 }
 
@@ -455,4 +472,119 @@ fn missing_herdr_cli_is_fatal() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot run"));
+}
+
+/// git stub that hangs until killed; paired with SLOW_REGISTRY.
+const STUB_GIT_HANG_SH: &str = "#!/bin/sh\nsleep 30\n";
+const STUB_GIT_HANG_CMD: &str = "@echo off\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+
+#[test]
+fn update_kills_git_past_deadline() {
+    let dir = setup("update-timeout");
+    write_registry(&dir, SLOW_REGISTRY);
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "timeout_secs = 1\n").unwrap();
+    if cfg!(windows) {
+        std::fs::write(dir.join("stub-git.cmd"), STUB_GIT_HANG_CMD).unwrap();
+    } else {
+        std::fs::write(dir.join("stub-git.sh"), STUB_GIT_HANG_SH).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("stub-git.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+    let start = std::time::Instant::now();
+    let out = run(&dir, &["update"], Some(&cfg));
+    let elapsed = start.elapsed();
+    assert_eq!(out.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("timed out after 1s"), "{e}");
+    assert!(
+        elapsed.as_secs() < 20,
+        "hung git must be killed, not waited for: {elapsed:?}"
+    );
+    assert_eq!(installs(&dir), "", "timed-out plugin must not be installed");
+}
+
+/// git stub that records start/end around a short sleep, so tests can assert
+/// that at most `max_concurrency` git processes run at once.
+const STUB_GIT_POOL_SH: &str = r#"#!/bin/sh
+log="$(dirname "$0")/git-runs.log"
+echo "start" >> "$log"
+sleep 0.1
+echo "end" >> "$log"
+url=""
+ref=""
+for a in "$@"; do
+  case "$a" in
+    https://github.com/*) url="$a" ;;
+    refs/*) ref="$a" ;;
+  esac
+done
+case "$url" in
+  *herdr-flock*)
+    if [ -n "$ref" ]; then
+      echo "1111111111111111111111111111111111111111 HEAD"
+    else
+      echo "ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD"
+    fi
+    ;;
+  *herdr-file-viewer*) echo "71d4c1c3706e7958c714789b035a99d949620a9e HEAD" ;;
+  *) exit 1 ;;
+esac
+"#;
+
+const STUB_GIT_POOL_CMD: &str = "@echo off\r\n\
+echo start>> \"%~dp0git-runs.log\"\r\n\
+ping -n 2 127.0.0.1 >nul\r\n\
+echo end>> \"%~dp0git-runs.log\"\r\n\
+set \"has_ref=no\"\r\n\
+for %%a in (%*) do (\r\n\
+  echo %%a | findstr /c:\"refs/\" >nul\r\n\
+  if not errorlevel 1 set \"has_ref=yes\"\r\n\
+)\r\n\
+echo %* | findstr /c:\"herdr-flock\" >nul\r\n\
+if not errorlevel 1 (\r\n\
+  if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 HEAD & exit /b 0 )\r\n\
+  echo ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD & exit /b 0\r\n\
+)\r\n\
+echo %* | findstr /c:\"herdr-file-viewer\" >nul\r\n\
+if not errorlevel 1 ( echo 71d4c1c3706e7958c714789b035a99d949620a9e HEAD & exit /b 0 )\r\n\
+exit /b 1\r\n";
+
+#[test]
+fn update_concurrency_bounded_by_config() {
+    let dir = setup("update-pool");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "max_concurrency = 1\n").unwrap();
+    if cfg!(windows) {
+        std::fs::write(dir.join("stub-git.cmd"), STUB_GIT_POOL_CMD).unwrap();
+    } else {
+        std::fs::write(dir.join("stub-git.sh"), STUB_GIT_POOL_SH).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("stub-git.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+    let out = run(&dir, &["update"], Some(&cfg));
+    let log = std::fs::read_to_string(dir.join("git-runs.log")).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines.len() >= 4, "git must run more than once: {log}");
+    for w in lines.windows(2) {
+        assert!(
+            !(w[0] == "start" && w[1] == "start"),
+            "concurrent git runs with max_concurrency=1: {log}"
+        );
+    }
+    assert_eq!(out.status.code(), Some(2)); // REGISTRY still has check errors
 }

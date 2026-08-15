@@ -15,8 +15,12 @@ which replaces the managed checkout while preserving plugin config and state.
   `git ls-remote`) and reinstalls the outdated ones. Plugins installed with
   `herdr plugin install --ref` keep their pin: they are compared and
   reinstalled against that same ref, never moved to `HEAD`.
-- Remote checks run in parallel, so the check time is one network round trip
+- Remote checks run in parallel under a bounded worker pool
+  (`max_concurrency`, default 8), so the check time is one network round trip
   regardless of how many plugins are installed.
+- Every remote check has a hard wall-clock deadline (`timeout_secs`, default
+  20): a wedged git process is killed, so a dead network cannot hang herdr
+  startup.
 - Automatic check + reinstall at herdr server startup (toggleable).
 - Desktop notification when updates ran (`herdr notification show`,
   toggleable).
@@ -73,6 +77,15 @@ notify = true
 
 # Plugin ids to skip during updates.
 exclude = ["flock.farm"]
+
+# Hard wall-clock deadline for each upstream check (git ls-remote), in
+# seconds (default 20). Kills a wedged git process so herdr startup cannot
+# hang on a dead network connection.
+timeout_secs = 20
+
+# Upper bound on concurrent upstream checks (default 8). Registry-wide runs
+# never spawn more git processes than this.
+max_concurrency = 8
 ```
 
 ## CLI
@@ -82,9 +95,10 @@ When herdr runs the plugin it injects `HERDR_BIN_PATH`; for standalone use the
 
 ### Check for updates
 
-`herdr-auto-update check` — report which GitHub-installed plugins have newer
-commits upstream. Exits `1` when updates are available, `2` when any plugin
-check errored, `0` otherwise.
+`herdr-auto-update check` — report which GitHub-installed plugins have an
+upstream ref (HEAD or the pinned ref) that differs from the installed commit.
+Exits `1` when updates are available, `2` when any plugin check errored, `0`
+otherwise.
 
 ```bash
 herdr-auto-update check
@@ -104,8 +118,9 @@ herdr-auto-update check --json
 ### Update plugins
 
 `herdr-auto-update update` — reinstall every outdated plugin through
-`herdr plugin install`. Exits `1` when one or more reinstalls failed. Shows a
-notification when updates ran (unless `notify = false`).
+`herdr plugin install`. Exits `1` when one or more reinstalls failed, `2` when
+any plugin check errored (successfully checked plugins are still updated in
+that case). Shows a notification when updates ran (unless `notify = false`).
 
 ```bash
 herdr-auto-update update

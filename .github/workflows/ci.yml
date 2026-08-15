@@ -23,6 +23,14 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
+      - name: Manifest version consistency
+        run: |
+          cargo_ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          plugin_ver=$(grep -m1 '^version' herdr-plugin.toml | sed 's/.*= *"\(.*\)"/\1/')
+          test "$cargo_ver" = "$plugin_ver" || {
+            echo "version mismatch: Cargo.toml=$cargo_ver herdr-plugin.toml=$plugin_ver" >&2
+            exit 1
+          }
       - name: Release build
         run: cargo build --release
       - name: Launcher smoke test (unix)

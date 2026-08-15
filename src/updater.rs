@@ -5,17 +5,17 @@
 use crate::config::Config;
 use crate::registry;
 use serde::Serialize;
-use std::process::{Command, ExitCode};
+use std::io::Read;
+use std::process::{Command, ExitCode, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// Short network timeouts so a dead connection cannot stall herdr startup.
-const GIT_TIMEOUT_ARGS: [&str; 6] = [
-    "-c",
-    "http.connectTimeout=10",
-    "-c",
-    "http.lowSpeedLimit=1",
-    "-c",
-    "http.lowSpeedTime=15",
-];
+/// These are git-config hints; a hard wall-clock kill is enforced separately
+/// by `run_git_with_timeout`, so a wedged connection cannot hang forever.
+/// (`http.connectTimeout` is not a real git-config key, hence absent.)
+const GIT_TIMEOUT_ARGS: [&str; 4] = ["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginStatus {
@@ -43,8 +43,8 @@ pub fn run_startup(cfg: &Config, json: bool) -> ExitCode {
     run_update(cfg, json, None)
 }
 
-pub fn run_check(json: bool, only: Option<&str>) -> ExitCode {
-    let statuses = match collect(only) {
+pub fn run_check(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    let statuses = match collect(cfg, only) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -78,7 +78,7 @@ pub fn run_check(json: bool, only: Option<&str>) -> ExitCode {
 }
 
 pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
-    let statuses = match collect(only) {
+    let statuses = match collect(cfg, only) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -89,12 +89,14 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     let mut updated: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut excluded: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
     for s in &statuses {
         if let Some(err) = &s.error {
             if !json {
                 eprintln!("  [{}] error: {err}", s.plugin_id);
             }
+            errors.push(s.plugin_id.clone());
             continue;
         }
         if !s.update_available {
@@ -144,18 +146,27 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             "updated": updated,
             "failed": failed,
             "excluded": excluded,
+            "errors": errors,
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
-        eprintln!(
+        let mut summary = format!(
             "[herdr-auto-update] {} updated, {} failed",
             updated.len(),
             failed.len()
         );
-        notify(cfg, updated.len(), failed.len());
+        if !errors.is_empty() {
+            summary.push_str(&format!(", {} error(s)", errors.len()));
+        }
+        eprintln!("{summary}");
+        notify(cfg, updated.len(), failed.len(), errors.len());
     }
 
-    if failed.is_empty() {
+    // Check errors take precedence over install failures so scripts can tell
+    // "could not verify upstream" (2) apart from "installs failed" (1).
+    if !errors.is_empty() {
+        ExitCode::from(2)
+    } else if failed.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -164,14 +175,18 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
 
 /// Best-effort desktop notification through herdr's CLI. Failures are
 /// ignored: a missing notification API must not change the exit code.
-fn notify(cfg: &Config, updated: usize, failed: usize) {
-    if !cfg.notify || (updated == 0 && failed == 0) {
+fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize) {
+    if !cfg.notify || (updated == 0 && failed == 0 && errors == 0) {
         return;
     }
-    let body = match (updated, failed) {
-        (0, f) => format!("{f} plugin update(s) failed"),
-        (u, 0) => format!("{u} plugin(s) updated"),
-        (u, f) => format!("{u} updated, {f} failed"),
+    let body = match (updated, failed, errors) {
+        (0, 0, e) => format!("{e} plugin(s) could not be checked"),
+        (0, f, 0) => format!("{f} plugin update(s) failed"),
+        (0, f, e) => format!("{f} plugin update(s) failed, {e} could not be checked"),
+        (u, 0, 0) => format!("{u} plugin(s) updated"),
+        (u, 0, e) => format!("{u} plugin(s) updated, {e} could not be checked"),
+        (u, f, 0) => format!("{u} updated, {f} failed"),
+        (u, f, e) => format!("{u} updated, {f} failed, {e} could not be checked"),
     };
     let bin = registry::herdr_bin();
     let _ = Command::new(&bin)
@@ -218,7 +233,7 @@ struct RemoteJob {
 /// With `only`, restrict to one plugin id; an id that is absent from the
 /// registry, or not a GitHub-installed plugin, is a hard error so `--only`
 /// can never silently no-op.
-fn collect(only: Option<&str>) -> Result<Vec<PluginStatus>, String> {
+fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String> {
     let plugins = registry::list_installed()?;
 
     // Resolve each plugin to either an immediate status (skipped kinds,
@@ -298,18 +313,41 @@ fn collect(only: Option<&str>) -> Result<Vec<PluginStatus>, String> {
         }
     }
 
+    // Worker pool: at most `max_concurrency` git processes at once. A
+    // registry full of plugins must not spawn an unbounded number of
+    // processes, and a slow network must not serialize all checks.
+    let workers = jobs.len().min(cfg.max_concurrency.max(1));
+    let timeout_secs = cfg.timeout_secs;
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = jobs
-            .iter()
-            .map(|job| {
-                let owner = job.owner.clone();
-                let repo = job.repo.clone();
-                let requested_ref = job.requested_ref.clone();
-                scope.spawn(move || remote_head(&owner, &repo, requested_ref.as_deref()))
-            })
-            .collect();
-        for (handle, job) in handles.into_iter().zip(&jobs) {
-            let result = handle.join().expect("remote_head thread panicked");
+        let next = &next;
+        let jobs = &jobs;
+        let (res_tx, res_rx) = mpsc::channel::<(usize, Result<Option<String>, String>)>();
+        for _ in 0..workers {
+            let res_tx = res_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= jobs.len() {
+                        break;
+                    }
+                    let job = &jobs[i];
+                    let result = remote_head(
+                        &job.owner,
+                        &job.repo,
+                        job.requested_ref.as_deref(),
+                        timeout_secs,
+                    );
+                    // Workers only exit after every job index is claimed, and
+                    // the collector only exits after every result arrives.
+                    res_tx.send((i, result)).expect("result channel closed");
+                }
+            });
+        }
+        drop(res_tx);
+        for _ in 0..jobs.len() {
+            let (index, result) = res_rx.recv().expect("all workers exited early");
+            let job = &jobs[index];
             let status = match result {
                 Ok(Some(sha)) => PluginStatus {
                     plugin_id: job.plugin_id.clone(),
@@ -359,16 +397,14 @@ fn remote_head(
     owner: &str,
     repo: &str,
     requested_ref: Option<&str>,
+    timeout_secs: u64,
 ) -> Result<Option<String>, String> {
     let url = format!("https://github.com/{owner}/{repo}");
     let mut args: Vec<&str> = GIT_TIMEOUT_ARGS.to_vec();
     args.push("ls-remote");
     args.push(&url);
     args.push(requested_ref.unwrap_or("HEAD"));
-    let out = Command::new(git_bin())
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run git: {e}"))?;
+    let out = run_git_with_timeout(&args, timeout_secs)?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -384,6 +420,56 @@ fn remote_head(
         Ok(Some(sha.to_owned()))
     } else {
         Ok(None)
+    }
+}
+
+/// Run `git` with a wall-clock deadline. `timeout_secs == 0` disables the
+/// deadline. The child's stdout/stderr are read to completion so the pipe
+/// buffer cannot fill up and stall the child past the deadline; a timed-out
+/// process is killed and reaped before we return.
+fn run_git_with_timeout(args: &[&str], timeout_secs: u64) -> Result<Output, String> {
+    let mut child = Command::new(git_bin())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if timeout_secs == 0 {
+        return child
+            .wait_with_output()
+            .map_err(|e| format!("cannot run git: {e}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = stdout.read_to_end(&mut out);
+                let _ = stderr.read_to_end(&mut err);
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("git ls-remote timed out after {timeout_secs}s"));
+                }
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot wait for git: {e}"));
+            }
+        }
+        // Brief sleep so a hung child does not busy-spin the worker.
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

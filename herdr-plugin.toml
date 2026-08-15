@@ -1,6 +1,6 @@
 id = "herdr-auto-update"
 name = "herdr-auto-update"
-version = "0.0.2"
+version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Check installed herdr plugins for newer upstream commits and reinstall them; optionally runs automatically at herdr startup"
 platforms = ["linux", "macos", "windows"]

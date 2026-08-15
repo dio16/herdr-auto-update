@@ -89,7 +89,7 @@ fn main() -> ExitCode {
             }
             updater::run_startup(&cfg, json)
         }
-        "check" => updater::run_check(json, only.as_deref()),
+        "check" => updater::run_check(&cfg, json, only.as_deref()),
         "update" => updater::run_update(&cfg, json, only.as_deref()),
         other => {
             eprintln!("error: unknown command '{other}'");
