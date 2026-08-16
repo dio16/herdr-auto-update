@@ -15,7 +15,7 @@ const USAGE: &str = "\
 herdr-auto-update - check/update installed herdr plugins
 
 USAGE:
-    herdr-auto-update <startup|check|plan|apply|update|history|rollback|resume> [--json] [--config <path>] [--only <plugin_id>]
+    herdr-auto-update <startup|check|plan|apply|update|history|rollback|resume|untrack> [--json] [--config <path>] [--only <plugin_id>]
 
 COMMANDS:
     startup   check and reinstall outdated plugins (used by herdr's startup hook)
@@ -26,11 +26,12 @@ COMMANDS:
     history   print the recorded update/rollback trail from state.json
     rollback  reinstall plugins from the commit recorded before their last update
     resume    reinstall plugins from the tracking ref recorded before their last rollback
+    untrack   reinstall a commit-pinned plugin without --ref (requires --only)
 
 FLAGS:
     --json           machine-readable output (check/plan/apply/update/history/rollback/resume)
     --config <path>  override the plugin config file
-    --only <id>      restrict plan/apply/update/rollback/resume to one plugin id
+    --only <id>      restrict plan/apply/update/rollback/resume/untrack to one plugin id
     -V, --version    print version
     -h, --help       print help
 
@@ -111,6 +112,7 @@ fn main() -> ExitCode {
         }
         "rollback" => updater::run_rollback(&cfg, json, only.as_deref()),
         "resume" => updater::run_resume(&cfg, json, only.as_deref()),
+        "untrack" => updater::run_untrack(&cfg, json, only.as_deref()),
         other => {
             eprintln!("error: unknown command '{other}'");
             eprintln!("{USAGE}");

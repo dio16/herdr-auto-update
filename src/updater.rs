@@ -244,6 +244,10 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     let mut excluded: Vec<String> = Vec::new();
     let mut held: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    // Commit-pinned plugins: immutable by construction, never auto-updated
+    // (v0.4 channels). Reported separately so startup/update runs surface
+    // why a plugin can never update (v1.0.4: pin notice).
+    let mut pinned: Vec<String> = Vec::new();
 
     for e in &plan {
         match e.action {
@@ -257,6 +261,23 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             }
             Action::Hold => {
                 if e.status == Status::Same {
+                    if e.ref_kind == RefKind::Commit {
+                        pinned.push(e.plugin_id.clone());
+                        if !json {
+                            let hint = match e.reason.as_deref() {
+                                Some(r) if r.starts_with("pinned by rollback") => {
+                                    " (pinned by rollback; run `resume`)"
+                                }
+                                _ => " (commit-pinned; not auto-updated)",
+                            };
+                            println!(
+                                "  [{}] up to date ({}){hint}",
+                                e.plugin_id,
+                                version_str(&e.version, &e.installed_sha)
+                            );
+                        }
+                        continue;
+                    }
                     if !json {
                         println!(
                             "  [{}] up to date ({})",
@@ -329,6 +350,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             "failed": failed,
             "excluded": excluded,
             "held": held,
+            "pinned": pinned,
             "errors": errors,
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -341,11 +363,31 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         if !held.is_empty() {
             summary.push_str(&format!(", {} held", held.len()));
         }
+        if !pinned.is_empty() {
+            summary.push_str(&format!(", {} pinned", pinned.len()));
+            eprintln!(
+                "[herdr-auto-update] {} plugin(s) are pinned to commits and cannot be \
+                 auto-updated: {}",
+                pinned.len(),
+                pinned.join(", ")
+            );
+            eprintln!(
+                "[herdr-auto-update] hint: `herdr-auto-update untrack --only <plugin_id>` \
+                 reinstalls one from its default branch (rejoins updates)"
+            );
+        }
         if !errors.is_empty() {
             summary.push_str(&format!(", {} error(s)", errors.len()));
         }
         eprintln!("{summary}");
-        notify(cfg, updated.len(), failed.len(), errors.len(), held.len());
+        notify(
+            cfg,
+            updated.len(),
+            failed.len(),
+            errors.len(),
+            held.len(),
+            pinned.len(),
+        );
     }
 
     // Check errors take precedence over install failures so scripts can tell
@@ -441,8 +483,10 @@ fn decide(cfg: &Config, s: &PluginStatus) -> (Action, Option<String>) {
 
 /// Best-effort desktop notification through herdr's CLI. Failures are
 /// ignored: a missing notification API must not change the exit code.
-fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize, held: usize) {
-    if !cfg.notify || (updated == 0 && failed == 0 && errors == 0 && held == 0) {
+/// `pinned` covers commit-pinned plugins (never auto-updateable) so a
+/// startup run surfaces them instead of silently reporting "up to date".
+fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize, held: usize, pinned: usize) {
+    if !cfg.notify || (updated == 0 && failed == 0 && errors == 0 && held == 0 && pinned == 0) {
         return;
     }
     let mut parts: Vec<String> = Vec::new();
@@ -457,6 +501,9 @@ fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize, held: usiz
     }
     if held > 0 {
         parts.push(format!("{held} held by policy"));
+    }
+    if pinned > 0 {
+        parts.push(format!("{pinned} pinned to commits (not auto-updated)"));
     }
     let body = if parts.is_empty() {
         "no changes".to_string()
@@ -546,18 +593,14 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         return ExitCode::from(2);
     };
     let mut st = state::State::load(&dir);
-    if st.entries.is_empty() {
-        if !json {
-            eprintln!("[herdr-auto-update] no updates recorded - nothing to roll back");
-        }
-        return ExitCode::SUCCESS;
-    }
 
     // Roll back only the most recent update per plugin. Older history is
     // left alone: rolling back an A->B->C trail must install B once, not
     // rewind through every recorded update (v1.0.1 P0 fix). A plugin whose
     // newest entry is already `rolled_back` is skipped - it is already
     // rolled back, and resume is the way back onto the tracking ref.
+    // The empty-state early return is scoped to the no-`--only` path so an
+    // unknown id can never silently no-op (v1.0.4: `--only` contract).
     let targets: Vec<state::StateEntry> = match only {
         Some(id) => match st.latest_for(id) {
             Some(e) if e.result == "updated" => vec![e.clone()],
@@ -571,6 +614,12 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             }
         },
         None => {
+            if st.entries.is_empty() {
+                if !json {
+                    eprintln!("[herdr-auto-update] no updates recorded - nothing to roll back");
+                }
+                return ExitCode::SUCCESS;
+            }
             let mut seen: HashSet<&str> = HashSet::new();
             st.entries
                 .iter()
@@ -659,6 +708,12 @@ pub fn run_resume(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             }
         },
         None => {
+            if st.entries.is_empty() {
+                if !json {
+                    eprintln!("[herdr-auto-update] no rollbacks recorded - nothing to resume");
+                }
+                return ExitCode::SUCCESS;
+            }
             let mut seen: HashSet<&str> = HashSet::new();
             st.entries
                 .iter()
@@ -707,6 +762,71 @@ pub fn run_resume(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `untrack`: reinstall a commit-pinned plugin without `--ref`, switching it
+/// from a commit pin to default-branch tracking so it becomes auto-updateable
+/// again (v1.0.4: the "reinstall or not" choice from the pin notice).
+/// Requires `--only <plugin_id>` — reinstalling every plugin ref-less is too
+/// broad to do by accident. Does not touch state.json; the pin clears in
+/// herdr's registry when the ref-less install resolves.
+/// (`cfg` is unused today: untrack drives herdr directly and needs no policy
+/// or timeout settings; kept for dispatch symmetry.)
+pub fn run_untrack(_cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
+    let Some(id) = only else {
+        eprintln!("error: untrack requires --only <plugin_id> (one plugin at a time)");
+        eprintln!("usage: herdr-auto-update untrack --only <plugin_id>");
+        return ExitCode::from(2);
+    };
+    let plugins = match registry::list_installed() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(plugin) = plugins.iter().find(|p| p.plugin_id == id) else {
+        eprintln!("error: plugin '{id}' not found in the herdr registry");
+        return ExitCode::from(2);
+    };
+    let Some(src) = &plugin.source else {
+        eprintln!("error: plugin '{id}' is not a GitHub-installed plugin");
+        return ExitCode::from(2);
+    };
+    let (Some(owner), Some(repo)) = (&src.owner, &src.repo) else {
+        eprintln!("error: plugin '{id}' has no owner/repo recorded in the registry");
+        return ExitCode::from(2);
+    };
+    if ref_kind(src.requested_ref.as_deref()) != RefKind::Commit {
+        let ref_name = src.requested_ref.as_deref().unwrap_or("<none>");
+        eprintln!("error: plugin '{id}' is not pinned to a commit (requested_ref: {ref_name})");
+        return ExitCode::from(2);
+    }
+    if !json {
+        println!("  [{id}] untracking: reinstalling {owner}/{repo} without --ref (default branch)");
+    }
+    if !apply_update(owner, repo, None) {
+        return ExitCode::from(1);
+    }
+    // Confirm herdr actually cleared the pin (ref-less install resolves the
+    // default branch and records no requested_ref).
+    let still_pinned = registry::list_installed()
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|p| p.plugin_id == id))
+        .and_then(|p| p.source)
+        .map(|s| ref_kind(s.requested_ref.as_deref()) == RefKind::Commit)
+        .unwrap_or(false);
+    if still_pinned {
+        eprintln!("  [{id}] warning: registry still records a commit pin after reinstall",);
+        return ExitCode::from(1);
+    }
+    if !json {
+        println!(
+            "  [{id}] now tracking the default branch; run `herdr-auto-update update` to \
+             apply available updates"
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// `history`: print the recorded update/rollback trail from state.json.
@@ -859,11 +979,20 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
         // installed commit, so it can never be behind upstream and is never
         // updated. Skip the network entirely (v0.4 ref channels).
         if ref_kind(src.requested_ref.as_deref()) == RefKind::Commit {
+            // Distinguish a rollback quarantine (resume is the way back)
+            // from an install-time commit pin (untrack is the way back).
             let note = rollback_state
                 .as_ref()
                 .and_then(|s| s.latest_for(&p.plugin_id))
                 .filter(|e| e.result == "rolled_back")
-                .map(|_| "pinned by rollback; run `resume` to rejoin the tracking ref".to_string());
+                .map(|_| "pinned by rollback; run `resume` to rejoin the tracking ref".to_string())
+                .or_else(|| {
+                    Some(
+                        "pinned to a commit; not auto-updated (run `herdr-auto-update untrack \
+                         --only <plugin_id>` to track the default branch)"
+                            .to_string(),
+                    )
+                });
             let status = PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: owner.clone(),

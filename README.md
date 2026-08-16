@@ -286,13 +286,33 @@ herdr-auto-update resume --only herdr-file-viewer
 Every rollback and resume is appended to `state.json`, so `history` shows
 the full trail: `updated` → `rolled_back` → `updated`.
 
+### Pinned plugins (commit pins)
+
+A plugin whose `requested_ref` is a commit SHA is **pinned to a commit**:
+it is never auto-updated (the pin IS the installed commit). `check`/`plan`
+show `channel: commit`, and `update`/`startup` report it as `pinned` (JSON
+report field, stderr summary, and desktop notification) instead of silently
+listing it as up to date.
+
+This happens after a `rollback` (rejoin with `resume`) and for installs that
+were pinned to a specific commit. To switch a commit-pinned plugin back to
+default-branch tracking, reinstall it without a ref:
+
+```bash
+herdr-auto-update untrack --only <plugin_id>
+```
+
+`untrack` reinstalls the plugin through herdr without `--ref` and verifies
+the pin is gone. It requires `--only` (one plugin at a time) and exits `2`
+if the plugin is not commit-pinned or not in the registry.
+
 ### Common flags
 
 | Flag | Description |
 |---|---|
 | `--json` | machine-readable output (check/update; suppresses notifications) |
 | `--config <path>` | override the plugin config file |
-| `--only <plugin_id>` | restrict check/update to one plugin id |
+| `--only <plugin_id>` | restrict check/update/rollback/resume to one plugin id; required by `untrack` |
 | `-V, --version` | print the version |
 | `-h, --help` | print help |
 
@@ -302,7 +322,7 @@ the full trail: `updated` → `rolled_back` → `updated`.
 |---|---|
 | `0` | ok / everything up to date |
 | `1` | updates available (check), updates would apply (plan), one or more reinstalls failed (update/startup), or nothing to roll back / resume |
-| `2` | fatal error, bad usage, or one or more plugin checks errored |
+| `2` | fatal error, bad usage, or one or more plugin checks errored; `untrack` misuse or a plugin that is not commit-pinned |
 
 ## Development
 

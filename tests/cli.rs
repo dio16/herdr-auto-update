@@ -1014,6 +1014,147 @@ fn resume_default_branch_installs_without_ref() {
 }
 
 #[test]
+fn rollback_only_unknown_with_empty_state_is_fatal() {
+    let dir = setup("rollback-only-empty");
+    // No state.json: the --only path must still error (never silently no-op).
+    let out = run(&dir, &["rollback", "--only", "nope"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("no update recorded for plugin 'nope'"), "{e}");
+    assert_eq!(installs(&dir), "");
+}
+
+#[test]
+fn resume_without_state_exits_0() {
+    let dir = setup("resume-empty");
+    let out = run(&dir, &["resume"], None);
+    assert_eq!(out.status.code(), Some(0)); // nothing to resume is not a failure
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("no rollbacks recorded"), "{e}");
+    assert_eq!(installs(&dir), "");
+}
+
+/// PINNED_REGISTRY with commit.pinned's requested_ref cleared (what herdr's
+/// registry looks like after a ref-less reinstall) — used by the untrack
+/// stub to confirm the pin is gone post-install.
+const PINNED_REGISTRY_CLEARED: &str = r#"{"id":"cli:plugin","result":{"plugins":[
+  {"plugin_id":"tag.pinned","version":"1.0.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"2222222222222222222222222222222222222222","requested_ref":"refs/tags/v1.0.0"}},
+  {"plugin_id":"commit.pinned","version":"1.0.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"3333333333333333333333333333333333333333"}},
+  {"plugin_id":"flock.farm","version":"0.1.0","source":{"kind":"github","owner":"ragamo","repo":"herdr-flock","resolved_commit":"ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3"}}
+]}}"#;
+
+/// herdr stub that records installs and, after the first install, reports the
+/// cleared registry (ref-less install semantics).
+fn write_untrack_stub(dir: &Path) {
+    if cfg!(windows) {
+        std::fs::write(
+            dir.join("stub-herdr.cmd"),
+            "@echo off\r\n\
+if \"%1\"==\"plugin\" if \"%2\"==\"list\" (\r\n\
+  if exist \"%~dp0installed.flag\" ( type \"%~dp0registry-cleared.json\" ) else ( type \"%~dp0registry.json\" )\r\n\
+  exit /b 0\r\n\
+)\r\n\
+if \"%1\"==\"plugin\" if \"%2\"==\"install\" (\r\n\
+  echo %*>> \"%~dp0installs.log\"\r\n\
+  type nul > \"%~dp0installed.flag\"\r\n\
+  exit /b 0\r\n\
+)\r\n\
+exit /b 1\r\n",
+        )
+        .unwrap();
+    } else {
+        std::fs::write(
+            dir.join("stub-herdr.sh"),
+            "#!/bin/sh\n\
+if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then\n\
+  if [ -f \"$(dirname \"$0\")/installed.flag\" ]; then cat \"$(dirname \"$0\")/registry-cleared.json\"; else cat \"$(dirname \"$0\")/registry.json\"; fi\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then\n\
+  echo \"$@\" >> \"$(dirname \"$0\")/installs.log\"\n\
+  touch \"$(dirname \"$0\")/installed.flag\"\n\
+  exit 0\n\
+fi\n\
+exit 1\n",
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn untrack_requires_only() {
+    let dir = setup("untrack-no-only");
+    write_registry(&dir, PINNED_REGISTRY);
+    let out = run(&dir, &["untrack"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("untrack requires --only"), "{e}");
+    assert_eq!(installs(&dir), "");
+}
+
+#[test]
+fn untrack_reinstalls_commit_pin_ref_less() {
+    let dir = setup("untrack");
+    write_registry(&dir, PINNED_REGISTRY);
+    std::fs::write(dir.join("registry-cleared.json"), PINNED_REGISTRY_CLEARED).unwrap();
+    write_untrack_stub(&dir);
+    let out = run(&dir, &["untrack", "--only", "commit.pinned"], None);
+    assert_eq!(out.status.code(), Some(0));
+    let log = installs(&dir);
+    assert!(
+        log.contains("ragamo/herdr-flock --yes"),
+        "untrack must reinstall without --ref: {log}"
+    );
+    assert!(!log.contains("--ref"), "untrack must not pass --ref: {log}");
+    let s = stdout_of(&out);
+    assert!(s.contains("now tracking the default branch"), "{s}");
+}
+
+#[test]
+fn untrack_rejects_non_pinned_and_unknown() {
+    // Branch-tracked plugin -> rejected.
+    let dir = setup("untrack-branch");
+    write_registry(&dir, PINNED_REGISTRY);
+    let out = run(&dir, &["untrack", "--only", "flock.farm"], None);
+    assert_eq!(out.status.code(), Some(2));
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("not pinned to a commit"), "{e}");
+    assert_eq!(installs(&dir), "");
+    // Unknown id -> rejected.
+    let dir2 = setup("untrack-missing");
+    write_registry(&dir2, PINNED_REGISTRY);
+    let out2 = run(&dir2, &["untrack", "--only", "nope"], None);
+    assert_eq!(out2.status.code(), Some(2));
+    assert_eq!(installs(&dir2), "");
+}
+
+#[test]
+fn update_reports_commit_pins_and_notifies() {
+    let dir = setup("update-pinned");
+    write_registry(&dir, PINNED_REGISTRY);
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, "").unwrap(); // default notify policy
+    let out = run(&dir, &["update", "--json"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let s = stdout_of(&out);
+    assert!(
+        s.contains("\"pinned\": [\n    \"commit.pinned\"\n  ]"),
+        "update --json must list commit-pinned plugins: {s}"
+    );
+    assert!(s.contains("\"held\": [\n    \"tag.pinned\"\n  ]"), "{s}");
+    // Human run: notice on stderr + desktop notification body.
+    let out2 = run(&dir, &["update"], Some(&cfg));
+    let e = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        e.contains("pinned to commits and cannot be auto-updated"),
+        "{e}"
+    );
+    assert!(e.contains("untrack --only"), "{e}");
+    let n = notifications(&dir);
+    assert!(n.contains("pinned to commits"), "{n}");
+}
+
+#[test]
 fn plan_exit_reflects_actions_not_raw_changes() {
     // notify policy: upstream changed (behind) but action is HOLD -> 0.
     let dir = setup("plan-exit-notify");

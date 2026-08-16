@@ -1,3 +1,9 @@
 /target/
 /bin/.cache/
 /internal/
+
+# Windows-side artifacts that have no business in this repo. A literal
+# %SystemDrive% directory appeared in v1.0.2/v1.0.3 (an unexpanded env var in
+# a build step) and was committed; the files are removed from history since
+# v1.0.4. Keep the path ignored so it can never come back.
+/%SystemDrive%/
