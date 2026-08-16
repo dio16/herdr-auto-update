@@ -341,6 +341,13 @@ its SHA256 checksum (release assets: `herdr-auto-update-<version>-<triple>.tar.g
 pushes). The dev launchers `scripts/run.sh` / `scripts/run.ps1` remain for
 cargo-built installs.
 
+On first run the launcher installs a `~/.local/bin/herdr-auto-update` symlink
+(set `XDG_BIN_HOME` to override) so the CLI works as a standalone command
+after `herdr plugin install`; on Windows it writes
+`%LOCALAPPDATA%\Microsoft\WindowsApps\herdr-auto-update.cmd`. The plugin root
+is a stable hash of the plugin id, so the shim survives reinstalls and is
+re-created if it goes stale. Remove the shim when uninstalling the plugin.
+
 To be listed in the herdr marketplace, add the `herdr-plugin` topic to the
 repository on GitHub (the index refreshes automatically).
 
