@@ -243,7 +243,10 @@ fn check_reports_status_and_exit_2_when_errors() {
     // are errors, which take precedence over pending updates.
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
-    assert!(s.contains("up to date (v0.1.0)"), "flock: {s}");
+    assert!(
+        s.contains("up to date (installed v0.1.0, latest v0.1.0)"),
+        "flock: {s}"
+    );
     assert!(s.contains("update available"), "file-viewer: {s}");
     assert!(s.contains("cannot resolve remote HEAD"), "wave-tui: {s}");
     assert!(s.contains("invalid owner/repo"), "evil: {s}");
@@ -261,13 +264,19 @@ fn check_shows_version_names_not_shas() {
     let s = stdout_of(&out);
     // Installed versions come from the registry manifest; the remote version
     // from the newest tag (stub git emits refs/tags/ lines for --tags).
-    assert!(s.contains("[flock.farm] up to date (v0.1.0)"), "{s}");
     assert!(
-        s.contains("update available: v1.14.0 -> v1.15.0"),
+        s.contains("[flock.farm] up to date (installed v0.1.0, latest v0.1.0)"),
+        "{s}"
+    );
+    assert!(
+        s.contains("update available: installed v1.14.0 -> latest v1.15.0"),
         "remote version must come from the newest tag: {s}"
     );
     // A plugin without a manifest version keeps the short-SHA fallback.
-    assert!(s.contains("[pinned.stable] up to date (11111111)"), "{s}");
+    assert!(
+        s.contains("[pinned.stable] up to date (installed 11111111, latest 11111111)"),
+        "{s}"
+    );
 }
 
 #[test]
@@ -372,6 +381,26 @@ fn startup_updates_by_default() {
     // startup delegates to update: check errors (3 in REGISTRY) -> exit 2.
     assert_eq!(out.status.code(), Some(2));
     assert!(installs(&dir).contains("smarzban/herdr-file-viewer"));
+}
+
+#[test]
+fn check_shows_installed_and_latest_versions() {
+    // Unique setup name: check_shows_version_names_not_shas uses
+    // "check-versions"; sharing the temp dir would race the two tests.
+    let dir = setup("check-versions2");
+    write_registry(&dir, CLEAN_REGISTRY);
+    let out = run(&dir, &["check"], None);
+    // flock.farm is up to date: both numbers shown, unambiguous.
+    let s = stdout_of(&out);
+    assert!(
+        s.contains("[flock.farm] up to date (installed v0.1.0, latest v0.1.0)"),
+        "{s}"
+    );
+    // herdr-file-viewer is behind: installed -> latest (newest tag), not SHAs.
+    assert!(
+        s.contains("update available: installed v1.14.0 -> latest v1.15.0"),
+        "{s}"
+    );
 }
 
 #[test]
@@ -1130,7 +1159,9 @@ fn untrack_rejects_non_pinned_and_unknown() {
 
 #[test]
 fn update_reports_commit_pins_and_notifies() {
-    let dir = setup("update-pinned");
+    // NOTE: unique setup name - update_passes_ref_flag_for_pinned_plugins
+    // also uses "update-pinned"; sharing a temp dir races the two tests.
+    let dir = setup("update-pinned-notify");
     write_registry(&dir, PINNED_REGISTRY);
     let cfg = dir.join("config.toml");
     std::fs::write(&cfg, "").unwrap(); // default notify policy
@@ -1152,6 +1183,13 @@ fn update_reports_commit_pins_and_notifies() {
     assert!(e.contains("untrack --only"), "{e}");
     let n = notifications(&dir);
     assert!(n.contains("pinned to commits"), "{n}");
+    // Non-interactive (test stdin is not a TTY): pinned plugins must NOT be
+    // reinstalled; the interactive prompt is TTY-gated.
+    assert_eq!(
+        installs(&dir),
+        "",
+        "non-interactive update must not reinstall pinned plugins"
+    );
 }
 
 #[test]

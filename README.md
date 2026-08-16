@@ -296,16 +296,17 @@ report field, stderr summary, and desktop notification) instead of silently
 listing it as up to date.
 
 This happens after a `rollback` (rejoin with `resume`) and for installs that
-were pinned to a specific commit. To switch a commit-pinned plugin back to
-default-branch tracking, reinstall it without a ref:
+were pinned to a specific commit. To update a commit-pinned plugin, run
+`herdr-auto-update update` from a terminal: each pinned plugin is offered a
+prompt (`reinstall from the default branch to update? [y/N]`) that clears
+the pin and moves it to the default branch's latest commit in one step.
+herdr's startup auto-update never prompts — it only reports pinned plugins.
+For scripts, `untrack --only <plugin_id>` does the same reinstall
+non-interactively.
 
-```bash
-herdr-auto-update untrack --only <plugin_id>
-```
-
-`untrack` reinstalls the plugin through herdr without `--ref` and verifies
-the pin is gone. It requires `--only` (one plugin at a time) and exits `2`
-if the plugin is not commit-pinned or not in the registry.
+`check`/`plan`/`update` show both versions per plugin — `installed X ->
+latest Y` — so what is on disk and how far it can go are always explicit
+(e.g. `update available: installed v1.14.0 -> latest v1.15.0`).
 
 ### Common flags
 

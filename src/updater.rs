@@ -8,7 +8,7 @@ use crate::registry;
 use crate::state;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::process::{Child, Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -260,29 +260,74 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 errors.push(e.plugin_id.clone());
             }
             Action::Hold => {
+                let from = version_str(&e.version, &e.installed_sha);
+                let to = version_str(&e.remote_version, e.remote_sha.as_deref().unwrap_or("?"));
                 if e.status == Status::Same {
                     if e.ref_kind == RefKind::Commit {
+                        let note = e.reason.as_deref().unwrap_or("");
+                        // Manual `update` from a terminal: offer to reinstall
+                        // the pinned plugin from its default branch, which
+                        // clears the pin and moves it to the latest commit in
+                        // one step. herdr startup and scripts (non-TTY stdin)
+                        // never prompt - they keep the pinned report only.
+                        // Rollback quarantines stay on `resume` (it restores
+                        // the original tracking ref, not just the default
+                        // branch).
+                        let interactive = !json && std::io::stdin().is_terminal();
+                        if interactive && !note.starts_with("pinned by rollback") {
+                            print!(
+                                "  [{}] pinned to a commit (installed {from}); reinstall \
+                                 from the default branch to update? [y/N] ",
+                                e.plugin_id
+                            );
+                            let _ = std::io::stdout().flush();
+                            let mut ans = String::new();
+                            let _ = std::io::stdin().read_line(&mut ans);
+                            if yes_answer(&ans) {
+                                if apply_update(&e.owner, &e.repo, None) {
+                                    let current_sha = resolved_commit_of(&e.plugin_id)
+                                        .unwrap_or_else(|| e.installed_sha.clone());
+                                    record_pin_update(cfg, e, &current_sha);
+                                    if !json {
+                                        println!(
+                                            "  [{}] updated: reinstalled from the default \
+                                             branch (installed {from} -> latest {})",
+                                            e.plugin_id,
+                                            short(&current_sha)
+                                        );
+                                    }
+                                    updated.push(e.plugin_id.clone());
+                                } else {
+                                    if !json {
+                                        eprintln!("  [{}] reinstall failed", e.plugin_id);
+                                    }
+                                    failed.push(e.plugin_id.clone());
+                                }
+                                continue;
+                            }
+                            if !json {
+                                println!("  [{}] keeping commit pin", e.plugin_id);
+                            }
+                        }
                         pinned.push(e.plugin_id.clone());
                         if !json {
-                            let hint = match e.reason.as_deref() {
-                                Some(r) if r.starts_with("pinned by rollback") => {
-                                    " (pinned by rollback; run `resume`)"
-                                }
-                                _ => " (commit-pinned; not auto-updated)",
+                            let hint = if note.starts_with("pinned by rollback") {
+                                " (pinned by rollback; run `resume`)"
+                            } else {
+                                " (commit-pinned; not auto-updated; run `update` from a \
+                                  terminal to update it interactively)"
                             };
                             println!(
-                                "  [{}] up to date ({}){hint}",
-                                e.plugin_id,
-                                version_str(&e.version, &e.installed_sha)
+                                "  [{}] up to date (installed {from}, latest {from}){hint}",
+                                e.plugin_id
                             );
                         }
                         continue;
                     }
                     if !json {
                         println!(
-                            "  [{}] up to date ({})",
-                            e.plugin_id,
-                            version_str(&e.version, &e.installed_sha)
+                            "  [{}] up to date (installed {from}, latest {from})",
+                            e.plugin_id
                         );
                     }
                     continue;
@@ -291,9 +336,9 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     excluded.push(e.plugin_id.clone());
                     if !json {
                         println!(
-                            "  [{}] update available ({}) but excluded",
-                            e.plugin_id,
-                            version_str(&e.version, &e.installed_sha)
+                            "  [{}] update available (installed {from} -> latest {to}) but \
+                             excluded",
+                            e.plugin_id
                         );
                     }
                 } else {
@@ -301,9 +346,9 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     if !json {
                         let why = e.reason.as_deref().unwrap_or("held");
                         println!(
-                            "  [{}] update available ({}) but held ({why})",
-                            e.plugin_id,
-                            version_str(&e.version, &e.installed_sha)
+                            "  [{}] update available (installed {from} -> latest {to}) but \
+                             held ({why})",
+                            e.plugin_id
                         );
                     }
                 }
@@ -318,9 +363,15 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     .unwrap_or_default();
                 let animated = !json && std::io::stdout().is_terminal();
                 if !json && !animated {
-                    println!("  [{}] updating {from} -> {to}{pin}", e.plugin_id);
+                    println!(
+                        "  [{}] updating installed {from} -> latest {to}{pin}",
+                        e.plugin_id
+                    );
                 }
-                let label = format!("updating {} {from} -> {to}{pin}", e.plugin_id);
+                let label = format!(
+                    "updating {} installed {from} -> latest {to}{pin}",
+                    e.plugin_id
+                );
                 let ok = crate::progress::with_activity(&label, {
                     let owner = e.owner.clone();
                     let repo = e.repo.clone();
@@ -329,7 +380,10 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 });
                 if animated {
                     if ok {
-                        println!("  [{}] updated {from} -> {to}{pin}", e.plugin_id);
+                        println!(
+                            "  [{}] updated installed {from} -> latest {to}{pin}",
+                            e.plugin_id
+                        );
                     } else {
                         eprintln!("  [{}] update failed ({to})", e.plugin_id);
                     }
@@ -372,8 +426,9 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 pinned.join(", ")
             );
             eprintln!(
-                "[herdr-auto-update] hint: `herdr-auto-update untrack --only <plugin_id>` \
-                 reinstalls one from its default branch (rejoins updates)"
+                "[herdr-auto-update] hint: run `herdr-auto-update update` from a terminal to \
+                 update pinned plugins interactively; `untrack --only <plugin_id>` switches \
+                 one to the default branch non-interactively"
             );
         }
         if !errors.is_empty() {
@@ -569,6 +624,30 @@ fn record_update(cfg: &Config, e: &PlanEntry) {
             Err(err) => eprintln!("  [{}] warning: verify error: {err}", e.plugin_id),
         }
     }
+}
+
+/// Record a pin-clearing reinstall as an update entry (v1.0.8): the plugin
+/// moved from a commit pin to the default branch's latest commit via the
+/// interactive `update` path.
+fn record_pin_update(cfg: &Config, e: &PlanEntry, new_sha: &str) {
+    let Some(dir) = cfg.data_dir() else { return };
+    let mut st = state::State::load(&dir);
+    st.append(state::StateEntry {
+        plugin_id: e.plugin_id.clone(),
+        previous_sha: e.installed_sha.clone(),
+        current_sha: new_sha.to_string(),
+        requested_ref: None,
+        updated_at: state::rfc3339_now(),
+        result: "updated".to_string(),
+    });
+    if let Err(err) = st.save(&dir) {
+        eprintln!("  warning: {err}");
+    }
+}
+
+/// Interactive prompt answer: `y` / `yes` (case-insensitive) accept.
+fn yes_answer(ans: &str) -> bool {
+    matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Confirm herdr's registry resolves `plugin_id` to `expected` (the commit we
@@ -988,8 +1067,8 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
                 .map(|_| "pinned by rollback; run `resume` to rejoin the tracking ref".to_string())
                 .or_else(|| {
                     Some(
-                        "pinned to a commit; not auto-updated (run `herdr-auto-update untrack \
-                         --only <plugin_id>` to track the default branch)"
+                        "pinned to a commit; not auto-updated (run `herdr-auto-update update` \
+                         from a terminal to update it interactively)"
                             .to_string(),
                     )
                 });
@@ -1388,24 +1467,40 @@ fn status_line(s: &PluginStatus) -> String {
         return format!("[{}] error: {err}", s.plugin_id);
     }
     let from = version_str(&s.version, &s.installed_sha);
+    let to = version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"));
     match s.status {
+        // "installed X -> latest Y" answers what is on disk now and how far
+        // the plugin can go (v1.0.8 UX).
         Status::Behind => format!(
-            "[{}] update available: {from} -> {}",
-            s.plugin_id,
-            version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"))
+            "[{}] update available: installed {from} -> latest {to}",
+            s.plugin_id
         ),
         Status::Ahead => format!(
-            "[{}] ahead of upstream ({from} -> {})",
-            s.plugin_id,
-            version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"))
+            "[{}] ahead of upstream (installed {from}, latest {to})",
+            s.plugin_id
         ),
         Status::Diverged => format!(
-            "[{}] diverged from upstream ({from} -> {})",
-            s.plugin_id,
-            version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"))
+            "[{}] diverged from upstream (installed {from}, latest {to})",
+            s.plugin_id
         ),
-        Status::Unknown => format!("[{}] unknown ({from} -> ?)", s.plugin_id),
-        Status::Same => format!("[{}] up to date ({from})", s.plugin_id),
+        Status::Unknown => format!("[{}] unknown (installed {from})", s.plugin_id),
+        Status::Same => {
+            let mut line = format!(
+                "[{}] up to date (installed {from}, latest {from})",
+                s.plugin_id
+            );
+            if let Some(note) = &s.note {
+                let hint = if note.starts_with("pinned by rollback") {
+                    " (pinned by rollback; run `resume`)"
+                } else if note.starts_with("pinned to a commit") {
+                    " (commit-pinned; not auto-updated)"
+                } else {
+                    ""
+                };
+                line.push_str(hint);
+            }
+            line
+        }
     }
 }
 
@@ -1464,6 +1559,19 @@ fn short(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yes_answer_accepts_y_and_yes_only() {
+        assert!(yes_answer("y"));
+        assert!(yes_answer("Y"));
+        assert!(yes_answer("yes"));
+        assert!(yes_answer("  Yes \n"));
+        assert!(!yes_answer(""));
+        assert!(!yes_answer("n"));
+        assert!(!yes_answer("N"));
+        assert!(!yes_answer("no"));
+        assert!(!yes_answer("maybe"));
+    }
 
     #[test]
     fn short_truncates() {
