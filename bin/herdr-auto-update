@@ -16,28 +16,16 @@
 set -eu
 
 # Resolve this script's real path. herdr invokes it as `sh bin/...` from the
-# plugin root; the standalone CLI shim (~/.local/bin/herdr-auto-update) is a
-# symlink to this file, so follow one link to stay inside the plugin root.
+# plugin root; a manually created launcher symlink (e.g. a shell alias) is
+# followed here so the plugin root is always found correctly. The standalone
+# CLI shim on PATH is a self-resolving script (scripts/install-cli-shim.sh),
+# not a symlink, so it needs no fix-up here.
 SELF=$0
 if [ -L "$SELF" ]; then
     SELF=$(readlink "$SELF" 2>/dev/null || printf '%s' "$SELF")
 fi
 DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)
 PLUGIN_ROOT=$(CDPATH= cd -- "$DIR/.." && pwd)
-
-# Standalone CLI shim: expose this launcher on the user's PATH so
-# `herdr-auto-update check` works from a shell (v1.0.5). Best-effort and
-# silent - a read-only home or missing bin dir never breaks a plugin action.
-# herdr names the plugin root by a stable hash of the plugin id, so the
-# symlink survives reinstalls; a missing or re-pointed shim is re-created.
-if [ -n "${XDG_BIN_HOME:-}" ] || [ -n "${HOME:-}" ]; then
-    shim_dir=${XDG_BIN_HOME:-"$HOME/.local/bin"}
-    SHIM="$shim_dir/herdr-auto-update"
-    if [ ! -e "$SHIM" ] || [ "$(readlink "$SHIM" 2>/dev/null || true)" != "$DIR/herdr-auto-update" ]; then
-        mkdir -p "$shim_dir" 2>/dev/null || true
-        ln -sfn "$DIR/herdr-auto-update" "$SHIM" 2>/dev/null || true
-    fi
-fi
 
 # 1. Local release build (dev path).
 if [ -x "$PLUGIN_ROOT/target/release/herdr-auto-update" ]; then

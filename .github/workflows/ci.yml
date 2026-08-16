@@ -38,7 +38,8 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           sh bin/herdr-auto-update --version
-          test -e "$HOME/.local/bin/herdr-auto-update" || { echo "PATH shim missing"; exit 1; }
+          sh scripts/install-cli-shim.sh
+          test -x "$HOME/.local/bin/herdr-auto-update" || { echo "PATH shim missing"; exit 1; }
           "$HOME/.local/bin/herdr-auto-update" --version
       - name: Launcher syntax check (unix)
         if: runner.os != 'Windows'

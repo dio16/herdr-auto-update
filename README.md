@@ -345,9 +345,9 @@ cargo-built installs.
 Installation runs a small post-install hook that puts `herdr-auto-update` on
 your PATH (`~/.local/bin/herdr-auto-update`, set `XDG_BIN_HOME` to override;
 Windows: `%LOCALAPPDATA%\Microsoft\WindowsApps\herdr-auto-update.cmd`), so
-`herdr-auto-update check` works from a shell right away. The plugin root is a
-stable hash of the plugin id, so the shim survives reinstalls; the launcher
-re-creates it if it goes stale. Remove the shim when uninstalling the plugin.
+`herdr-auto-update check` works from a shell right away. The shim is a small
+self-resolving script (it locates the plugin via `herdr plugin list`), so it
+survives reinstalls; remove it when uninstalling the plugin.
 
 To be listed in the herdr marketplace, add the `herdr-plugin` topic to the
 repository on GitHub (the index refreshes automatically).
