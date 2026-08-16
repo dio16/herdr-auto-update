@@ -81,6 +81,9 @@ jobs:
           $fake = Join-Path $env:TEMP ("hau-shim-" + $PID)
           New-Item -ItemType Directory -Path (Join-Path $fake "bin") -Force | Out-Null
           $manifest = Join-Path $fake "herdr-plugin.toml"
+          # herdr reports extended-length paths (\\?\C:\...) on Windows; the
+          # resolver must normalize them before Join-Path/Test-Path.
+          $manifest = '\\?\' + $manifest
           # JSON strings must escape backslashes (real herdr emits valid JSON)
           $manifestJson = $manifest.Replace('\', '\\')
           $launcher = Join-Path $fake "bin\herdr-auto-update.ps1"

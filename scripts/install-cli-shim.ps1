@@ -44,7 +44,12 @@ try {
     Remove-Item `$tmp -ErrorAction SilentlyContinue
     `$p = (`$text | ConvertFrom-Json).result.plugins | Where-Object { `$_.plugin_id -eq 'herdr-auto-update' } | Select-Object -First 1
     if (`$p -and `$p.manifest_path) {
-        `$l = Join-Path (Split-Path -Parent `$p.manifest_path) 'bin\herdr-auto-update.ps1'
+        # herdr reports extended-length paths (\\?\C:\...) on Windows and
+        # Join-Path cannot parse the drive from them; normalize first.
+        `$mp = `$p.manifest_path
+        if (`$mp.StartsWith('\\?\UNC\')) { `$mp = '\\' + `$mp.Substring(7) }
+        elseif (`$mp.StartsWith('\\?\')) { `$mp = `$mp.Substring(4) }
+        `$l = (Split-Path -Parent `$mp) + '\bin\herdr-auto-update.ps1'
         if (Test-Path `$l) {
             & powershell -NoProfile -ExecutionPolicy Bypass -File `$l @args
             exit `$LASTEXITCODE
