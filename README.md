@@ -66,10 +66,11 @@ which replaces the managed checkout while preserving plugin config and state.
 herdr plugin install dio16/herdr-auto-update
 ```
 
-No Rust toolchain is required: the manifest has no build step (clone-only
-install), and the `bin/` launcher downloads the versioned prebuilt binary for
-your platform from GitHub Releases on first use, verifying its SHA256
-checksum before running it. The binary is cached in `bin/.cache/`.
+No Rust toolchain is required: the manifest's `[[build]]` steps are not
+compilation — they install the standalone CLI shim — and the `bin/` launcher
+downloads the versioned prebuilt binary for your platform from GitHub
+Releases on first use, verifying its SHA256 checksum before running it. The
+binary is cached in `bin/.cache/`.
 
 If the plugin is already registered from a local dev checkout
 (`herdr plugin link`), install from GitHub fails with
@@ -341,12 +342,12 @@ its SHA256 checksum (release assets: `herdr-auto-update-<version>-<triple>.tar.g
 pushes). The dev launchers `scripts/run.sh` / `scripts/run.ps1` remain for
 cargo-built installs.
 
-On first run the launcher installs a `~/.local/bin/herdr-auto-update` symlink
-(set `XDG_BIN_HOME` to override) so the CLI works as a standalone command
-after `herdr plugin install`; on Windows it writes
-`%LOCALAPPDATA%\Microsoft\WindowsApps\herdr-auto-update.cmd`. The plugin root
-is a stable hash of the plugin id, so the shim survives reinstalls and is
-re-created if it goes stale. Remove the shim when uninstalling the plugin.
+Installation runs a small post-install hook that puts `herdr-auto-update` on
+your PATH (`~/.local/bin/herdr-auto-update`, set `XDG_BIN_HOME` to override;
+Windows: `%LOCALAPPDATA%\Microsoft\WindowsApps\herdr-auto-update.cmd`), so
+`herdr-auto-update check` works from a shell right away. The plugin root is a
+stable hash of the plugin id, so the shim survives reinstalls; the launcher
+re-creates it if it goes stale. Remove the shim when uninstalling the plugin.
 
 To be listed in the herdr marketplace, add the `herdr-plugin` topic to the
 repository on GitHub (the index refreshes automatically).

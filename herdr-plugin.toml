@@ -1,14 +1,24 @@
 id = "herdr-auto-update"
 name = "herdr-auto-update"
-version = "1.0.5"
+version = "1.0.6"
 min_herdr_version = "0.7.0"
 description = "Check installed herdr plugins for newer upstream commits and reinstall them; optionally runs automatically at herdr startup"
 platforms = ["linux", "macos", "windows"]
 
-# No [[build]] step: install is clone-only so a Rust toolchain is NOT required.
-# Every command goes through the bin/ launcher shim, which downloads the
-# versioned prebuilt binary from GitHub Releases on first run and verifies its
-# SHA256 checksum (see .github/workflows/release.yml).
+# The [[build]] steps below are NOT compilation - they install the standalone
+# CLI shim (~/.local/bin/herdr-auto-update / WindowsApps .cmd) so the command
+# works from a shell right after `herdr plugin install`. No Rust toolchain is
+# required: the real binary is downloaded by the bin/ launcher shim from
+# GitHub Releases on first run, verified against its SHA256 checksum
+# (see .github/workflows/release.yml). The scripts are best-effort and always
+# exit 0, so a read-only home never fails the install.
+[[build]]
+platforms = ["linux", "macos"]
+command = ["sh", "scripts/install-cli-shim.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/install-cli-shim.ps1"]
 
 # Auto check + reinstall at herdr server startup (respects config auto_update).
 [[startup]]
