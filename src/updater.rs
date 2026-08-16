@@ -151,10 +151,23 @@ pub fn run_check(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             print_status(s);
         }
         eprintln!(
-            "[herdr-auto-update] checked {}, updates available {}, errors {}",
-            statuses.len(),
-            pending,
-            errors
+            "{}",
+            paint(
+                color_enabled(),
+                if errors > 0 {
+                    "31"
+                } else if pending > 0 {
+                    "33"
+                } else {
+                    "32"
+                },
+                &format!(
+                    "[herdr-auto-update] checked {}, updates available {}, errors {}",
+                    statuses.len(),
+                    pending,
+                    errors
+                )
+            )
         );
     }
     // Errors take precedence over pending updates so scripts can tell a
@@ -239,6 +252,8 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         );
     }
 
+    let color = color_enabled();
+
     let mut updated: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut excluded: Vec<String> = Vec::new();
@@ -254,7 +269,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             Action::Error => {
                 if !json {
                     if let Some(err) = &e.reason {
-                        eprintln!("✗ [{}] error: {err}", e.plugin_id);
+                        eprintln!("{} [{}] {err}", red(color, "✗ Error"), e.plugin_id);
                     }
                 }
                 errors.push(e.plugin_id.clone());
@@ -290,8 +305,8 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                                     record_pin_update(cfg, e, &current_sha);
                                     if !json {
                                         println!(
-                                            "  [{}] updated: reinstalled from the default \
-                                             branch (installed {from} -> latest {})",
+                                            "{} [{}] ({from} -> {})",
+                                            green(color, "✓ Updated"),
                                             e.plugin_id,
                                             short(&current_sha)
                                         );
@@ -299,7 +314,11 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                                     updated.push(e.plugin_id.clone());
                                 } else {
                                     if !json {
-                                        eprintln!("  [{}] reinstall failed", e.plugin_id);
+                                        eprintln!(
+                                            "{} [{}] reinstall failed",
+                                            red(color, "✗ Update failed"),
+                                            e.plugin_id
+                                        );
                                     }
                                     failed.push(e.plugin_id.clone());
                                 }
@@ -314,15 +333,22 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                             let hint = if note.starts_with("pinned by rollback") {
                                 ", pinned by rollback; run `resume`)"
                             } else {
-                                ", commit-pinned; not auto-updated; run `update` from a \
-                                  terminal to update it interactively)"
+                                ", not auto-updated)"
                             };
-                            println!("PIN [{}] up to date ({from}{hint}", e.plugin_id);
+                            println!(
+                                "{} [{}] ({from}{hint}",
+                                cyan(color, "ℹ Pinned"),
+                                e.plugin_id
+                            );
                         }
                         continue;
                     }
                     if !json {
-                        println!("✓ [{}] up to date ({from})", e.plugin_id);
+                        println!(
+                            "{} [{}] ({from})",
+                            green(color, "✓ No changes needed"),
+                            e.plugin_id
+                        );
                     }
                     continue;
                 }
@@ -330,7 +356,8 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     excluded.push(e.plugin_id.clone());
                     if !json {
                         println!(
-                            "· [{}] update available ({from} -> {to}) but excluded",
+                            "{} [{}] ({from} -> {to}) - excluded",
+                            yellow(color, "⚠ Update available"),
                             e.plugin_id
                         );
                     }
@@ -339,7 +366,8 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     if !json {
                         let why = e.reason.as_deref().unwrap_or("held");
                         println!(
-                            "· [{}] update available ({from} -> {to}) but held ({why})",
+                            "{} [{}] ({from} -> {to}) - held ({why})",
+                            yellow(color, "⚠ Update available"),
                             e.plugin_id
                         );
                     }
@@ -364,11 +392,15 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     let requested_ref = e.requested_ref.clone();
                     move || apply_update(&owner, &repo, requested_ref.as_deref())
                 });
-                if animated {
+                if !json {
                     if ok {
-                        println!("✓ [{}] updated {from} -> {to}{pin}", e.plugin_id);
+                        println!(
+                            "{} [{}] ({from} -> {to}{pin})",
+                            green(color, "✓ Updated"),
+                            e.plugin_id
+                        );
                     } else {
-                        eprintln!("✗ [{}] update failed ({to})", e.plugin_id);
+                        eprintln!("{} [{}] ({to})", red(color, "✗ Update failed"), e.plugin_id);
                     }
                 }
                 if ok {
@@ -418,7 +450,16 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         if !errors.is_empty() {
             summary.push_str(&format!(", errors {}", errors.len()));
         }
-        eprintln!("{summary}");
+        // Summary color reinforces the worst outcome: green = all good,
+        // yellow = held/pinned (attention), red = failed/errored.
+        let severity = if !errors.is_empty() || !failed.is_empty() {
+            "31"
+        } else if !held.is_empty() || !pinned.is_empty() {
+            "33"
+        } else {
+            "32"
+        };
+        eprintln!("{}", paint(color, severity, &summary));
         if !held.is_empty() && cfg.policy == Policy::Notify {
             eprintln!(
                 "[herdr-auto-update] note: {} update(s) held - policy \"notify\" never \
@@ -887,7 +928,7 @@ pub fn run_untrack(_cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         .map(|s| ref_kind(s.requested_ref.as_deref()) == RefKind::Commit)
         .unwrap_or(false);
     if still_pinned {
-        eprintln!("  [{id}] warning: registry still records a commit pin after reinstall",);
+        eprintln!("  [{id}] warning: registry still records a commit pin after reinstall");
         return ExitCode::from(1);
     }
     if !json {
@@ -1021,7 +1062,7 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
                 error: Some("github source missing owner/repo/commit fields".to_string()),
                 note: None,
             };
-            progress.done(i, false, status_line(&status));
+            progress.done(i, false, status_line(&status, color_enabled()));
             statuses.push(Some(status));
             continue;
         };
@@ -1041,7 +1082,7 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
                 error: Some("invalid owner/repo recorded in registry".to_string()),
                 note: None,
             };
-            progress.done(i, false, status_line(&status));
+            progress.done(i, false, status_line(&status, color_enabled()));
             statuses.push(Some(status));
             continue;
         }
@@ -1078,7 +1119,7 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
                 error: None,
                 note,
             };
-            progress.done(i, true, status_line(&status));
+            progress.done(i, true, status_line(&status, color_enabled()));
             statuses.push(Some(status));
             continue;
         }
@@ -1164,7 +1205,11 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
                 error: result.error,
                 note: None,
             };
-            progress.done(job.index, status.error.is_none(), status_line(&status));
+            progress.done(
+                job.index,
+                status.error.is_none(),
+                status_line(&status, color_enabled()),
+            );
             statuses[job.index] = Some(status);
         }
         if let Some(dir) = config_dir.as_deref() {
@@ -1453,45 +1498,94 @@ fn git_bin() -> String {
 /// The final report line for a plugin status, e.g.
 /// `[flock.farm] up to date (v0.1.0)`. Also used as the live-panel row
 /// label, so the panel and the report agree.
-/// One line per plugin for check/update reports and the progress panel. The
-/// leading marker is the scanable result (v1.0.10 UX): `✓` = nothing to do,
-/// `↑` = update available, `PIN` = commit-pinned (never auto-updated),
-/// `·` = held / diverged, `✗` = error. Up-to-date plugins show a single
-/// version - "up to date" already states latest == installed, so nobody has
-/// to compare v1 against v1; the installed -> latest arrow appears only when
-/// there is actually a move to make.
-fn status_line(s: &PluginStatus) -> String {
+/// ANSI SGR emphasis for status words. Color reinforces the status word and
+/// is disabled when stdout is not a terminal, NO_COLOR is set, or TERM=dumb
+/// (clig.dev / no-color.org), so piped output, CI logs, and `--json` never
+/// carry escape codes. Symbols + words carry the meaning regardless of color
+/// (color-blind / monochrome safe).
+fn paint(enabled: bool, code: &str, s: &str) -> String {
+    if enabled {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var("NO_COLOR").is_err()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
+}
+
+fn green(color: bool, s: &str) -> String {
+    paint(color, "32", s)
+}
+fn yellow(color: bool, s: &str) -> String {
+    paint(color, "33", s)
+}
+fn red(color: bool, s: &str) -> String {
+    paint(color, "31", s)
+}
+fn cyan(color: bool, s: &str) -> String {
+    paint(color, "36", s)
+}
+
+/// One line per plugin for check/update reports and the progress panel
+/// (v1.0.12 UX). Status word first, then the plugin: the word states the
+/// outcome explicitly - "Updated" only when something actually changed,
+/// "No changes needed" when nothing did (a bare "up to date" reads like an
+/// action and is avoided). Colors: green = ok, yellow = attention, cyan =
+/// informational, red = error. Color only reinforces the word: symbols +
+/// text carry the meaning in monochrome/CI output.
+fn status_line(s: &PluginStatus, color: bool) -> String {
     if let Some(err) = &s.error {
-        return format!("✗ [{}] error: {err}", s.plugin_id);
+        return format!("{} [{}] {err}", red(color, "✗ Error"), s.plugin_id);
     }
     let from = version_str(&s.version, &s.installed_sha);
     let to = version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"));
     match s.status {
-        Status::Behind => format!("↑ [{}] update available: {from} -> {to}", s.plugin_id),
-        Status::Ahead => format!("· [{}] ahead of upstream ({from} -> {to})", s.plugin_id),
-        Status::Diverged => format!(
-            "· [{}] diverged from upstream ({from} -> {to})",
+        Status::Behind => format!(
+            "{} [{}] ({from} -> {to})",
+            yellow(color, "⚠ Update available"),
             s.plugin_id
         ),
-        Status::Unknown => format!("✗ [{}] unknown ({from})", s.plugin_id),
+        Status::Ahead => format!(
+            "{} [{}] ({from} vs {to})",
+            yellow(color, "⚠ Ahead of upstream"),
+            s.plugin_id
+        ),
+        Status::Diverged => format!(
+            "{} [{}] ({from} vs {to})",
+            yellow(color, "⚠ Diverged"),
+            s.plugin_id
+        ),
+        Status::Unknown => format!("{} [{}] ({from})", red(color, "✗ Unknown"), s.plugin_id),
         Status::Same => {
             if s.ref_kind == RefKind::Commit {
                 let hint = match s.note.as_deref() {
                     Some(n) if n.starts_with("pinned by rollback") => {
                         ", pinned by rollback; run `resume`)"
                     }
-                    _ => ", commit-pinned; not auto-updated)",
+                    _ => ", not auto-updated)",
                 };
-                format!("PIN [{}] up to date ({from}{hint}", s.plugin_id)
+                format!(
+                    "{} [{}] ({from}{hint}",
+                    cyan(color, "ℹ Pinned"),
+                    s.plugin_id
+                )
             } else {
-                format!("✓ [{}] up to date ({from})", s.plugin_id)
+                format!(
+                    "{} [{}] ({from})",
+                    green(color, "✓ No changes needed"),
+                    s.plugin_id
+                )
             }
         }
     }
 }
 
 fn print_status(s: &PluginStatus) {
-    println!("  {}", status_line(s));
+    println!("  {}", status_line(s, color_enabled()));
 }
 
 /// Human version label: the resolved version (manifest / tag) prefixed with

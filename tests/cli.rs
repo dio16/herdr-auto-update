@@ -271,8 +271,11 @@ fn check_reports_status_and_exit_2_when_errors() {
     // are errors, which take precedence over pending updates.
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
-    assert!(s.contains("up to date (v0.1.0)"), "flock: {s}");
-    assert!(s.contains("update available"), "file-viewer: {s}");
+    assert!(
+        s.contains("No changes needed [flock.farm] (v0.1.0)"),
+        "flock: {s}"
+    );
+    assert!(s.contains("Update available"), "file-viewer: {s}");
     assert!(s.contains("cannot resolve remote HEAD"), "wave-tui: {s}");
     assert!(s.contains("invalid owner/repo"), "evil: {s}");
     assert!(
@@ -289,13 +292,16 @@ fn check_shows_version_names_not_shas() {
     let s = stdout_of(&out);
     // Installed versions come from the registry manifest; the remote version
     // from the newest tag (stub git emits refs/tags/ lines for --tags).
-    assert!(s.contains("[flock.farm] up to date (v0.1.0)"), "{s}");
+    assert!(s.contains("No changes needed [flock.farm] (v0.1.0)"), "{s}");
     assert!(
-        s.contains("update available: v1.14.0 -> v1.15.0"),
+        s.contains("Update available [herdr-file-viewer] (v1.14.0 -> v1.15.0)"),
         "remote version must come from the newest tag: {s}"
     );
     // A plugin without a manifest version keeps the short-SHA fallback.
-    assert!(s.contains("[pinned.stable] up to date (11111111)"), "{s}");
+    assert!(
+        s.contains("No changes needed [pinned.stable] (11111111)"),
+        "{s}"
+    );
 }
 
 #[test]
@@ -413,10 +419,10 @@ fn check_shows_installed_and_latest_versions() {
     let out = run(&dir, &["check"], None);
     // flock.farm is up to date: one version + ✓ marker, no comparison needed.
     let s = stdout_of(&out);
-    assert!(s.contains("✓ [flock.farm] up to date (v0.1.0)"), "{s}");
+    assert!(s.contains("No changes needed [flock.farm] (v0.1.0)"), "{s}");
     // herdr-file-viewer is behind: ↑ marker, installed -> latest (newest tag).
     assert!(
-        s.contains("↑ [herdr-file-viewer] update available: v1.14.0 -> v1.15.0"),
+        s.contains("Update available [herdr-file-viewer] (v1.14.0 -> v1.15.0)"),
         "{s}"
     );
 }
@@ -473,10 +479,10 @@ fn check_pinned_compares_against_ref_not_head() {
     // pinned.stable matches the ref (up to date) while pinned.old does not.
     let stable: Vec<&str> = s.lines().filter(|l| l.contains("pinned.stable")).collect();
     assert_eq!(stable.len(), 1, "{s}");
-    assert!(stable[0].contains("up to date"), "{s}");
+    assert!(stable[0].contains("No changes needed"), "{s}");
     let old: Vec<&str> = s.lines().filter(|l| l.contains("pinned.old")).collect();
     assert_eq!(old.len(), 1, "{s}");
-    assert!(old[0].contains("update available"), "{s}");
+    assert!(old[0].contains("Update available"), "{s}");
 }
 
 #[test]
@@ -1352,7 +1358,7 @@ fn commit_pin_skips_network_and_never_updates() {
     assert_eq!(calls.len(), 0, "commit.pinned must not hit git: {log}");
     let s = stdout_of(&out);
     assert!(s.contains("commit.pinned"), "{s}");
-    assert!(s.contains("up to date"), "{s}");
+    assert!(s.contains("Pinned [commit.pinned]"), "{s}");
 }
 
 #[test]
