@@ -44,14 +44,17 @@ jobs:
           # this checkout's manifest_path, so the shim resolves the launcher
           # and runs it (the resolver's herdr fallback path).
           FAKE=$(mktemp -d)
+          # Heredoc body MUST stay at the run-block indentation (YAML block
+          # scalar); the generated file then has leading spaces, which is
+          # fine for a script invoked via ENOEXEC shell fallback.
           cat > "$FAKE/herdr" <<'EOF'
-#!/bin/sh
-if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then
-  printf '{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-auto-update","manifest_path":"%s/herdr-plugin.toml"}]}}' "$PWD"
-  echo
-  exit 0
-fi
-exit 1
+          #!/bin/sh
+          if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then
+            printf '{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-auto-update","manifest_path":"%s/herdr-plugin.toml"}]}}' "$PWD"
+            echo
+            exit 0
+          fi
+          exit 1
 EOF
           chmod +x "$FAKE/herdr"
           PATH="$FAKE:$PATH" "$HOME/.local/bin/herdr-auto-update" --version
