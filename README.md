@@ -304,9 +304,15 @@ herdr's startup auto-update never prompts — it only reports pinned plugins.
 For scripts, `untrack --only <plugin_id>` does the same reinstall
 non-interactively.
 
-`check`/`plan`/`update` show both versions per plugin — `installed X ->
-latest Y` — so what is on disk and how far it can go are always explicit
-(e.g. `update available: installed v1.14.0 -> latest v1.15.0`).
+`check`/`plan`/`update` lead every plugin line with a scanable state marker
+so no comparison is needed: `✓` = up to date (nothing to do), `↑` = update
+available, `PIN` = commit-pinned (never auto-updated), `·` = held/diverged,
+`✗` = error. Up-to-date plugins show a single version (`✓ [flock.farm] up to
+date (v0.1.0)`); the installed -> latest arrow appears only when there is
+actually a move to make (`↑ [herdr-file-viewer] update available: v1.14.0 ->
+v1.15.0`). The summary is one line per run:
+`checked 4, updated 0, failed 0, held 0, pinned 0, errors 0`, plus a note
+when `policy = "notify"` held updates (reported, never installed).
 
 ### Common flags
 

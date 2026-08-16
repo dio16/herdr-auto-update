@@ -151,7 +151,7 @@ pub fn run_check(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             print_status(s);
         }
         eprintln!(
-            "[herdr-auto-update] {} plugin(s) checked, {} update(s) available, {} error(s)",
+            "[herdr-auto-update] checked {}, updates available {}, errors {}",
             statuses.len(),
             pending,
             errors
@@ -254,7 +254,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             Action::Error => {
                 if !json {
                     if let Some(err) = &e.reason {
-                        eprintln!("  [{}] error: {err}", e.plugin_id);
+                        eprintln!("✗ [{}] error: {err}", e.plugin_id);
                     }
                 }
                 errors.push(e.plugin_id.clone());
@@ -312,23 +312,17 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                         pinned.push(e.plugin_id.clone());
                         if !json {
                             let hint = if note.starts_with("pinned by rollback") {
-                                " (pinned by rollback; run `resume`)"
+                                ", pinned by rollback; run `resume`)"
                             } else {
-                                " (commit-pinned; not auto-updated; run `update` from a \
+                                ", commit-pinned; not auto-updated; run `update` from a \
                                   terminal to update it interactively)"
                             };
-                            println!(
-                                "  [{}] up to date (installed {from}, latest {from}){hint}",
-                                e.plugin_id
-                            );
+                            println!("PIN [{}] up to date ({from}{hint}", e.plugin_id);
                         }
                         continue;
                     }
                     if !json {
-                        println!(
-                            "  [{}] up to date (installed {from}, latest {from})",
-                            e.plugin_id
-                        );
+                        println!("✓ [{}] up to date ({from})", e.plugin_id);
                     }
                     continue;
                 }
@@ -336,8 +330,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     excluded.push(e.plugin_id.clone());
                     if !json {
                         println!(
-                            "  [{}] update available (installed {from} -> latest {to}) but \
-                             excluded",
+                            "· [{}] update available ({from} -> {to}) but excluded",
                             e.plugin_id
                         );
                     }
@@ -346,8 +339,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     if !json {
                         let why = e.reason.as_deref().unwrap_or("held");
                         println!(
-                            "  [{}] update available (installed {from} -> latest {to}) but \
-                             held ({why})",
+                            "· [{}] update available ({from} -> {to}) but held ({why})",
                             e.plugin_id
                         );
                     }
@@ -363,15 +355,9 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     .unwrap_or_default();
                 let animated = !json && std::io::stdout().is_terminal();
                 if !json && !animated {
-                    println!(
-                        "  [{}] updating installed {from} -> latest {to}{pin}",
-                        e.plugin_id
-                    );
+                    println!("  [{}] updating {from} -> {to}{pin}", e.plugin_id);
                 }
-                let label = format!(
-                    "updating {} installed {from} -> latest {to}{pin}",
-                    e.plugin_id
-                );
+                let label = format!("updating {} {from} -> {to}{pin}", e.plugin_id);
                 let ok = crate::progress::with_activity(&label, {
                     let owner = e.owner.clone();
                     let repo = e.repo.clone();
@@ -380,12 +366,9 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 });
                 if animated {
                     if ok {
-                        println!(
-                            "  [{}] updated installed {from} -> latest {to}{pin}",
-                            e.plugin_id
-                        );
+                        println!("✓ [{}] updated {from} -> {to}{pin}", e.plugin_id);
                     } else {
-                        eprintln!("  [{}] update failed ({to})", e.plugin_id);
+                        eprintln!("✗ [{}] update failed ({to})", e.plugin_id);
                     }
                 }
                 if ok {
@@ -410,15 +393,16 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
         let mut summary = format!(
-            "[herdr-auto-update] {} updated, {} failed",
+            "[herdr-auto-update] checked {}, updated {}, failed {}",
+            statuses.len(),
             updated.len(),
             failed.len()
         );
         if !held.is_empty() {
-            summary.push_str(&format!(", {} held", held.len()));
+            summary.push_str(&format!(", held {}", held.len()));
         }
         if !pinned.is_empty() {
-            summary.push_str(&format!(", {} pinned", pinned.len()));
+            summary.push_str(&format!(", pinned {}", pinned.len()));
             eprintln!(
                 "[herdr-auto-update] {} plugin(s) are pinned to commits and cannot be \
                  auto-updated: {}",
@@ -432,9 +416,16 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             );
         }
         if !errors.is_empty() {
-            summary.push_str(&format!(", {} error(s)", errors.len()));
+            summary.push_str(&format!(", errors {}", errors.len()));
         }
         eprintln!("{summary}");
+        if !held.is_empty() && cfg.policy == Policy::Notify {
+            eprintln!(
+                "[herdr-auto-update] note: {} update(s) held - policy \"notify\" never \
+                 installs (set policy = \"auto\" to install)",
+                held.len()
+            );
+        }
         notify(
             cfg,
             updated.len(),
@@ -1462,44 +1453,39 @@ fn git_bin() -> String {
 /// The final report line for a plugin status, e.g.
 /// `[flock.farm] up to date (v0.1.0)`. Also used as the live-panel row
 /// label, so the panel and the report agree.
+/// One line per plugin for check/update reports and the progress panel. The
+/// leading marker is the scanable result (v1.0.10 UX): `✓` = nothing to do,
+/// `↑` = update available, `PIN` = commit-pinned (never auto-updated),
+/// `·` = held / diverged, `✗` = error. Up-to-date plugins show a single
+/// version - "up to date" already states latest == installed, so nobody has
+/// to compare v1 against v1; the installed -> latest arrow appears only when
+/// there is actually a move to make.
 fn status_line(s: &PluginStatus) -> String {
     if let Some(err) = &s.error {
-        return format!("[{}] error: {err}", s.plugin_id);
+        return format!("✗ [{}] error: {err}", s.plugin_id);
     }
     let from = version_str(&s.version, &s.installed_sha);
     let to = version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"));
     match s.status {
-        // "installed X -> latest Y" answers what is on disk now and how far
-        // the plugin can go (v1.0.8 UX).
-        Status::Behind => format!(
-            "[{}] update available: installed {from} -> latest {to}",
-            s.plugin_id
-        ),
-        Status::Ahead => format!(
-            "[{}] ahead of upstream (installed {from}, latest {to})",
-            s.plugin_id
-        ),
+        Status::Behind => format!("↑ [{}] update available: {from} -> {to}", s.plugin_id),
+        Status::Ahead => format!("· [{}] ahead of upstream ({from} -> {to})", s.plugin_id),
         Status::Diverged => format!(
-            "[{}] diverged from upstream (installed {from}, latest {to})",
+            "· [{}] diverged from upstream ({from} -> {to})",
             s.plugin_id
         ),
-        Status::Unknown => format!("[{}] unknown (installed {from})", s.plugin_id),
+        Status::Unknown => format!("✗ [{}] unknown ({from})", s.plugin_id),
         Status::Same => {
-            let mut line = format!(
-                "[{}] up to date (installed {from}, latest {from})",
-                s.plugin_id
-            );
-            if let Some(note) = &s.note {
-                let hint = if note.starts_with("pinned by rollback") {
-                    " (pinned by rollback; run `resume`)"
-                } else if note.starts_with("pinned to a commit") {
-                    " (commit-pinned; not auto-updated)"
-                } else {
-                    ""
+            if s.ref_kind == RefKind::Commit {
+                let hint = match s.note.as_deref() {
+                    Some(n) if n.starts_with("pinned by rollback") => {
+                        ", pinned by rollback; run `resume`)"
+                    }
+                    _ => ", commit-pinned; not auto-updated)",
                 };
-                line.push_str(hint);
+                format!("PIN [{}] up to date ({from}{hint}", s.plugin_id)
+            } else {
+                format!("✓ [{}] up to date ({from})", s.plugin_id)
             }
-            line
         }
     }
 }
