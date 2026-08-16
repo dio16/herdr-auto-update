@@ -7,3 +7,10 @@
 # a build step) and was committed; the files are removed from history since
 # v1.0.4. Keep the path ignored so it can never come back.
 /%SystemDrive%/
+
+# General OS junk a `git add -A` on any machine could sweep in.
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log
+*.tmp
