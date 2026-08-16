@@ -81,6 +81,8 @@ jobs:
           $fake = Join-Path $env:TEMP ("hau-shim-" + $PID)
           New-Item -ItemType Directory -Path (Join-Path $fake "bin") -Force | Out-Null
           $manifest = Join-Path $fake "herdr-plugin.toml"
+          # JSON strings must escape backslashes (real herdr emits valid JSON)
+          $manifestJson = $manifest.Replace('\', '\\')
           $launcher = Join-Path $fake "bin\herdr-auto-update.ps1"
           @"
           Write-Output "ARGS: `$args"
@@ -90,14 +92,14 @@ jobs:
           @"
           @echo off
           if "%1"=="plugin" if "%2"=="list" (
-            echo {"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-auto-update","manifest_path":"$manifest"}]}}
+            echo {"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-auto-update","manifest_path":"$manifestJson"}]}}
             exit /b 0
           )
           exit /b 1
           "@ | Out-File -Encoding ascii (Join-Path $fake "herdr.cmd")
           $env:PATH = "$fake;$env:PATH"
           $out = & $cmd update --only some.plugin
-          if ($LASTEXITCODE -ne 0) { throw "shim failed with $LASTEXITCODE: $out" }
+          if ($LASTEXITCODE -ne 0) { throw "shim failed (exit $LASTEXITCODE): $out" }
           if ($out -notmatch "ARGS: update --only some.plugin") { throw "args not forwarded: $out" }
           Write-Output "shim chain ok: $out"
       - name: Launcher smoke test (unix)
