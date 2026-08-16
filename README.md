@@ -63,6 +63,16 @@ install), and the `bin/` launcher downloads the versioned prebuilt binary for
 your platform from GitHub Releases on first use, verifying its SHA256
 checksum before running it. The binary is cached in `bin/.cache/`.
 
+If the plugin is already registered from a local dev checkout
+(`herdr plugin link`), install from GitHub fails with
+`plugin ... is already linked from a local path`. Unlink it first, then
+install:
+
+```bash
+herdr plugin unlink herdr-auto-update
+herdr plugin install dio16/herdr-auto-update
+```
+
 Enable the actions you want in `~/.config/herdr/config.toml`
 (or `%APPDATA%\herdr\config.toml` on Windows):
 
@@ -139,8 +149,12 @@ allow_force_push = false
 
 ## CLI
 
-When herdr runs the plugin it injects `HERDR_BIN_PATH`; for standalone use the
-`herdr` binary is resolved from PATH.
+When herdr runs the plugin it injects `HERDR_BIN_PATH` and runs the command
+from the plugin root, so the launcher always finds the binary. For standalone
+use the `herdr-auto-update` executable must be on PATH: either
+`cargo install --path .` from a checkout (installs into `~/.cargo/bin`), or
+add the plugin's `bin/` directory (which contains the downloaded binary under
+`.cache/`) to PATH.
 
 ### Check for updates
 

@@ -9,6 +9,28 @@ $ErrorActionPreference = "Stop"
 $DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PLUGIN_ROOT = Split-Path -Parent $DIR
 
+# SHA256 hex of a file via pure .NET. Deliberately NOT Get-FileHash: when the
+# herdr server is launched from PowerShell 7 (pwsh), its inherited PSModulePath
+# lists pwsh 7 module dirs first, so Windows PowerShell 5.1 resolves the pwsh 7
+# Microsoft.PowerShell.Utility copy and Get-FileHash becomes unresolvable
+# (CommandNotFoundException) while other Utility cmdlets still work. .NET types
+# (mscorlib) resolve regardless of PSModulePath, so this works in every
+# PowerShell and every herdr launch context.
+function Get-FileSha256Hex([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $hash = $sha.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($hash)).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
+    }
+}
+
 # 1. Local release build (dev path).
 $dev = Join-Path $PLUGIN_ROOT "target\release\herdr-auto-update.exe"
 if (Test-Path $dev) {
@@ -58,7 +80,7 @@ try {
 
     $tarball = Join-Path $TMP $ASSET
     $expected = (Get-Content (Join-Path $TMP "checksums-$VERSION.txt") | Where-Object { $_ -match "\s$ASSET$" } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
-    $actual = (Get-FileHash $tarball -Algorithm SHA256).Hash.ToLower()
+    $actual = Get-FileSha256Hex $tarball
     if (-not $expected -or $expected -ne $actual) {
         Write-Error "herdr-auto-update: checksum mismatch for $ASSET (expected $expected, got $actual)"
     }
