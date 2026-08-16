@@ -24,8 +24,11 @@ SELF=$0
 if [ -L "$SELF" ]; then
     SELF=$(readlink "$SELF" 2>/dev/null || printf '%s' "$SELF")
 fi
-DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)
-PLUGIN_ROOT=$(CDPATH= cd -- "$DIR/.." && pwd)
+# `pwd -P` resolves the physical path, so a plugin root reached through a
+# symlinked directory (e.g. an install-time fake root, or a manual link in
+# ~/bin) still resolves to the real checkout.
+DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd -P)
+PLUGIN_ROOT=$(CDPATH= cd -- "$DIR/.." && pwd -P)
 
 # 1. Local release build (dev path).
 if [ -x "$PLUGIN_ROOT/target/release/herdr-auto-update" ]; then
