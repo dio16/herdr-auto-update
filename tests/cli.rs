@@ -221,6 +221,34 @@ fn auto_cfg(dir: &Path, extra: &str) -> PathBuf {
     cfg
 }
 
+/// Meta-test: every `setup("...")` temp-dir name must be unique. Tests run
+/// in parallel in one process, and `setup` derives the dir from the name +
+/// PID, so a duplicate name makes two tests race the same directory -
+/// the v1.0.8 macOS flake (update-pinned) and a later check-versions
+/// collision. The guard turns that bug class into a compile-time-fail-ish
+/// test failure instead of an intermittent CI red.
+#[test]
+fn setup_names_are_unique() {
+    let src = include_str!("cli.rs");
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut dup: Option<&str> = None;
+    let mut i = 0usize;
+    while let Some(rel) = src[i..].find("setup(\"") {
+        let start = i + rel + "setup(\"".len();
+        let end = src[start..].find('"').map(|e| start + e).unwrap_or(start);
+        let name = &src[start..end];
+        if !seen.insert(name) {
+            dup = Some(name);
+            break;
+        }
+        i = end;
+    }
+    assert!(
+        dup.is_none(),
+        "duplicate setup() temp-dir name {dup:?}: parallel tests would race the same dir"
+    );
+}
+
 /// Single github plugin whose stub git hangs forever; used by the
 /// hard-timeout test so only one git process is involved.
 const SLOW_REGISTRY: &str = r#"{"id":"cli:plugin","result":{"plugins":[

@@ -10,7 +10,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # arm64 Linux: aarch64-unknown-linux-gnu is a release target that was
+        # only ever cross-built; running the full suite on arm64 catches
+        # arch-specific bugs before they ship.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +37,69 @@ jobs:
           }
       - name: Release build
         run: cargo build --release
+      - name: PowerShell syntax check
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $files = @('bin/herdr-auto-update.ps1', 'scripts/install-cli-shim.ps1', 'scripts/run.ps1')
+          foreach ($f in $files) {
+            $null = [scriptblock]::Create((Get-Content -Raw $f))
+            Write-Output "syntax ok: $f"
+          }
+          # launcher SHA256 math (v1.0.2 pure-.NET fix) must agree with
+          # Get-FileHash - catches the pwsh-launched-herdr failure class.
+          $f = Join-Path (Get-Location) "Cargo.toml"
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $stream = [System.IO.File]::OpenRead($f)
+          try {
+            $hash = $sha.ComputeHash($stream)
+          } finally { $stream.Dispose(); $sha.Dispose() }
+          $hex = ([System.BitConverter]::ToString($hash)).Replace('-', '').ToLowerInvariant()
+          $expected = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+          if ($hex -ne $expected) { throw "SHA256 mismatch: $hex != $expected" }
+          Write-Output "sha256 math ok: $hex"
+      - name: Windows launcher smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File bin/herdr-auto-update.ps1 --version
+      - name: Windows CLI shim test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Regenerates the shim exactly like herdr's [[build]] hook, then
+          # exercises the full .cmd -> resolver -> launcher chain with a fake
+          # herdr on PATH. Would have caught the v1.0.8 -Command ParserError
+          # (trailing args were concatenated into the command string).
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-cli-shim.ps1
+          $shimDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+          $cmd = Join-Path $shimDir "herdr-auto-update.cmd"
+          $resolver = Join-Path $shimDir "herdr-auto-update.ps1"
+          if (-not (Test-Path $cmd)) { throw "shim .cmd missing" }
+          if (-not (Test-Path $resolver)) { throw "shim resolver missing" }
+          $null = [scriptblock]::Create((Get-Content -Raw $resolver))
+          # fake plugin root whose bin\herdr-auto-update.ps1 echoes its args
+          $fake = Join-Path $env:TEMP ("hau-shim-" + $PID)
+          New-Item -ItemType Directory -Path (Join-Path $fake "bin") -Force | Out-Null
+          $manifest = Join-Path $fake "herdr-plugin.toml"
+          $launcher = Join-Path $fake "bin\herdr-auto-update.ps1"
+          @"
+          Write-Output "ARGS: `$args"
+          exit 0
+          "@ | Out-File -Encoding ascii $launcher
+          # fake herdr reporting that plugin root
+          @"
+          @echo off
+          if "%1"=="plugin" if "%2"=="list" (
+            echo {"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-auto-update","manifest_path":"$manifest"}]}}
+            exit /b 0
+          )
+          exit /b 1
+          "@ | Out-File -Encoding ascii (Join-Path $fake "herdr.cmd")
+          $env:PATH = "$fake;$env:PATH"
+          $out = & $cmd update --only some.plugin
+          if ($LASTEXITCODE -ne 0) { throw "shim failed with $LASTEXITCODE: $out" }
+          if ($out -notmatch "ARGS: update --only some.plugin") { throw "args not forwarded: $out" }
+          Write-Output "shim chain ok: $out"
       - name: Launcher smoke test (unix)
         if: runner.os != 'Windows'
         run: |
@@ -51,3 +117,19 @@ jobs:
       - name: Launcher syntax check (unix)
         if: runner.os != 'Windows'
         run: sh -n bin/herdr-auto-update
+      - name: Launcher checksum fallback equivalence (unix)
+        if: runner.os != 'Windows'
+        run: |
+          # The launcher computes the SHA256 via sha256sum / shasum / openssl
+          # depending on the platform; every available branch must agree.
+          F=$(mktemp); head -c 4096 /dev/urandom > "$F"
+          exp=$(sha256sum "$F" | awk '{ print $1 }')
+          if command -v shasum >/dev/null 2>&1; then
+            via=$(shasum -a 256 "$F" | awk '{ print $1 }')
+            test "$exp" = "$via" || { echo "shasum mismatch: $via != $exp"; exit 1; }
+          fi
+          if command -v openssl >/dev/null 2>&1; then
+            via=$(openssl dgst -sha256 "$F" | awk '{ print $NF }')
+            test "$exp" = "$via" || { echo "openssl mismatch: $via != $exp"; exit 1; }
+          fi
+          echo "checksum fallback branches agree: $exp"

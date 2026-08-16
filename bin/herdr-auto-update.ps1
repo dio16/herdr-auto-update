@@ -9,28 +9,9 @@ $ErrorActionPreference = "Stop"
 $DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PLUGIN_ROOT = Split-Path -Parent $DIR
 
-# Standalone CLI shim (v1.0.5): expose the launcher on PATH so
-# `herdr-auto-update check` works from a console. %LOCALAPPDATA%\Microsoft\
-# WindowsApps is user-writable and on the Windows PATH. Best-effort and
-# silent - shim setup must never break a plugin action. The plugin root is a
-# stable hash of the plugin id, so the shim survives reinstalls; a stale
-# embedded path is rewritten.
-if ($env:LOCALAPPDATA) {
-    $shimDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
-    $shim = Join-Path $shimDir "herdr-auto-update.cmd"
-    $launcher = Join-Path $DIR "herdr-auto-update.ps1"
-    $expected = "@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$launcher`" %*`r`n"
-    try {
-        if (-not (Test-Path $shimDir)) { New-Item -ItemType Directory -Path $shimDir -Force | Out-Null }
-        $needsWrite = -not (Test-Path $shim)
-        if (-not $needsWrite) {
-            try { $needsWrite = (Get-Content -Raw $shim) -ne $expected } catch { $needsWrite = $true }
-        }
-        if ($needsWrite) { [System.IO.File]::WriteAllText($shim, $expected) }
-    } catch {
-        # ignore: shim is a convenience, never a dependency
-    }
-}
+# The standalone CLI shim (herdr-auto-update.cmd + resolver .ps1) is written
+# by scripts/install-cli-shim.ps1 at install time; this launcher does not
+# manage it.
 
 # SHA256 hex of a file via pure .NET. Deliberately NOT Get-FileHash: when the
 # herdr server is launched from PowerShell 7 (pwsh), its inherited PSModulePath

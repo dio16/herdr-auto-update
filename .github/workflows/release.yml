@@ -64,6 +64,24 @@ jobs:
           # use the cross gcc for aarch64-unknown-linux-gnu.
           RUSTFLAGS: ${{ matrix.linker != '' && format('-C linker={0}', matrix.linker) || '' }}
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Verify built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="target/${{ matrix.target }}/release/herdr-auto-update"
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="$exe.exe"; fi
+          case "${{ matrix.target }}" in
+            x86_64-*)
+              # Native target: actually run the artifact that ships.
+              "$exe" --version
+              ;;
+            aarch64-*)
+              # Cross-compiled: cannot execute on the host runner; verify the
+              # arch so a wrong-arch artifact never ships.
+              file "$exe" | grep -Eq "aarch64|ARM aarch64|arm64" || {
+                echo "unexpected arch for ${{ matrix.target }}:"; file "$exe"; exit 1; }
+              ;;
+          esac
       - name: Stage asset
         shell: bash
         run: |
