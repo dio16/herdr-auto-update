@@ -8,7 +8,7 @@ use crate::registry;
 use crate::state;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::{Child, Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -71,6 +71,10 @@ pub struct PluginStatus {
     pub version: Option<String>,
     pub installed_sha: String,
     pub remote_sha: Option<String>,
+    /// Upstream release name (newest tag / pinned tag) for a changed
+    /// plugin; display metadata only, never used for decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_version: Option<String>,
     pub update_available: bool,
     pub status: Status,
     pub ref_kind: RefKind,
@@ -105,7 +109,11 @@ pub struct PlanEntry {
     pub repo: String,
     pub installed_sha: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_version: Option<String>,
     pub status: Status,
     pub ref_kind: RefKind,
     pub policy: crate::config::Policy,
@@ -127,7 +135,7 @@ pub fn run_startup(cfg: &Config, json: bool) -> ExitCode {
 }
 
 pub fn run_check(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
-    let statuses = match collect(cfg, only) {
+    let statuses = match collect(cfg, only, json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -170,7 +178,7 @@ pub fn run_update(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
 /// code follows the unified contract: `2` on check errors, `1` when updates
 /// are available, `0` otherwise.
 pub fn run_plan(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
-    let statuses = match collect(cfg, only) {
+    let statuses = match collect(cfg, only, json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -183,9 +191,9 @@ pub fn run_plan(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     } else {
         for e in &plan {
             println!("{}", e.plugin_id);
-            println!("  installed: {}", short(&e.installed_sha));
+            println!("  installed: {}", version_str(&e.version, &e.installed_sha));
             if let Some(r) = &e.remote_sha {
-                println!("  remote: {}", short(r));
+                println!("  remote: {}", version_str(&e.remote_version, r));
             }
             println!("  status: {}", status_label(e.status));
             println!("  channel: {}", ref_kind_label(e.ref_kind));
@@ -215,7 +223,7 @@ pub fn run_plan(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
 /// `apply`: execute the plan — install every plugin whose action is UPDATE.
 /// Held and errored entries are reported but not installed.
 pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
-    let statuses = match collect(cfg, only) {
+    let statuses = match collect(cfg, only, json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -253,7 +261,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                         println!(
                             "  [{}] up to date ({})",
                             e.plugin_id,
-                            short(&e.installed_sha)
+                            version_str(&e.version, &e.installed_sha)
                         );
                     }
                     continue;
@@ -264,7 +272,7 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                         println!(
                             "  [{}] update available ({}) but excluded",
                             e.plugin_id,
-                            short(&e.installed_sha)
+                            version_str(&e.version, &e.installed_sha)
                         );
                     }
                 } else {
@@ -274,27 +282,38 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                         println!(
                             "  [{}] update available ({}) but held ({why})",
                             e.plugin_id,
-                            short(&e.installed_sha)
+                            version_str(&e.version, &e.installed_sha)
                         );
                     }
                 }
             }
             Action::Update => {
-                if !json {
-                    let pin = e
-                        .requested_ref
-                        .as_deref()
-                        .map(|r| format!(" (pinned {r})"))
-                        .unwrap_or_default();
-                    println!(
-                        "  [{}] updating {} -> {}{}",
-                        e.plugin_id,
-                        short(&e.installed_sha),
-                        short(e.remote_sha.as_deref().unwrap_or("?")),
-                        pin
-                    );
+                let from = version_str(&e.version, &e.installed_sha);
+                let to = version_str(&e.remote_version, e.remote_sha.as_deref().unwrap_or("?"));
+                let pin = e
+                    .requested_ref
+                    .as_deref()
+                    .map(|r| format!(" (pinned {r})"))
+                    .unwrap_or_default();
+                let animated = !json && std::io::stdout().is_terminal();
+                if !json && !animated {
+                    println!("  [{}] updating {from} -> {to}{pin}", e.plugin_id);
                 }
-                if apply_update(&e.owner, &e.repo, e.requested_ref.as_deref()) {
+                let label = format!("updating {} {from} -> {to}{pin}", e.plugin_id);
+                let ok = crate::progress::with_activity(&label, {
+                    let owner = e.owner.clone();
+                    let repo = e.repo.clone();
+                    let requested_ref = e.requested_ref.clone();
+                    move || apply_update(&owner, &repo, requested_ref.as_deref())
+                });
+                if animated {
+                    if ok {
+                        println!("  [{}] updated {from} -> {to}{pin}", e.plugin_id);
+                    } else {
+                        eprintln!("  [{}] update failed ({to})", e.plugin_id);
+                    }
+                }
+                if ok {
                     updated.push(e.plugin_id.clone());
                     record_update(cfg, e);
                 } else {
@@ -352,7 +371,9 @@ fn build_plan(cfg: &Config, statuses: &[PluginStatus]) -> Vec<PlanEntry> {
                 owner: s.owner.clone(),
                 repo: s.repo.clone(),
                 installed_sha: s.installed_sha.clone(),
+                version: s.version.clone(),
                 remote_sha: s.remote_sha.clone(),
+                remote_version: s.remote_version.clone(),
                 status: s.status,
                 ref_kind: s.ref_kind,
                 policy: cfg.policy,
@@ -752,13 +773,14 @@ struct RemoteJob {
 
 /// With `only`, restrict to one plugin id; an id that is absent from the
 /// registry, or not a GitHub-installed plugin, is a hard error so `--only`
-/// can never silently no-op.
-fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String> {
+/// can never silently no-op. `json` disables the live progress panel.
+fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginStatus>, String> {
     let plugins = registry::list_installed()?;
     // Loaded once for the commit-pinned branch: a plugin whose newest state
     // entry is `rolled_back` is commit-pinned by a rollback (quarantine) and
     // gets a note telling the user `resume` restores tracking (v1.0.1).
     let rollback_state = cfg.data_dir().map(|d| state::State::load(&d));
+    let mut progress = crate::progress::Progress::new(plugins.len(), json);
 
     // Resolve each plugin to either an immediate status (skipped kinds,
     // invalid entries) or a remote-resolution job. The remote checks run in
@@ -789,41 +811,48 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
             statuses.push(None);
             continue; // local links and other kinds are not updatable
         }
+        progress.row(i, &p.plugin_id);
         // A github entry may be missing owner/repo/resolved_commit (e.g. a
         // stale registry row); treat it as invalid instead of panicking.
         let (Some(owner), Some(repo), Some(rc)) = (&src.owner, &src.repo, &src.resolved_commit)
         else {
-            statuses.push(Some(PluginStatus {
+            let status = PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: src.owner.clone().unwrap_or_default(),
                 repo: src.repo.clone().unwrap_or_default(),
                 version: p.version.clone(),
                 installed_sha: src.resolved_commit.clone().unwrap_or_default(),
                 remote_sha: None,
+                remote_version: None,
                 update_available: false,
                 status: Status::Unknown,
                 ref_kind: ref_kind(src.requested_ref.as_deref()),
                 requested_ref: src.requested_ref.clone(),
                 error: Some("github source missing owner/repo/commit fields".to_string()),
                 note: None,
-            }));
+            };
+            progress.done(i, false, status_line(&status));
+            statuses.push(Some(status));
             continue;
         };
         if !registry::valid_github_name(owner, 39) || !registry::valid_github_name(repo, 100) {
-            statuses.push(Some(PluginStatus {
+            let status = PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: owner.clone(),
                 repo: repo.clone(),
                 version: p.version.clone(),
                 installed_sha: rc.clone(),
                 remote_sha: None,
+                remote_version: None,
                 update_available: false,
                 status: Status::Unknown,
                 ref_kind: ref_kind(src.requested_ref.as_deref()),
                 requested_ref: src.requested_ref.clone(),
                 error: Some("invalid owner/repo recorded in registry".to_string()),
                 note: None,
-            }));
+            };
+            progress.done(i, false, status_line(&status));
+            statuses.push(Some(status));
             continue;
         }
         // A commit-pinned plugin is immutable by construction: the pin IS the
@@ -835,20 +864,23 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 .and_then(|s| s.latest_for(&p.plugin_id))
                 .filter(|e| e.result == "rolled_back")
                 .map(|_| "pinned by rollback; run `resume` to rejoin the tracking ref".to_string());
-            statuses.push(Some(PluginStatus {
+            let status = PluginStatus {
                 plugin_id: p.plugin_id.clone(),
                 owner: owner.clone(),
                 repo: repo.clone(),
                 version: p.version.clone(),
                 installed_sha: rc.clone(),
                 remote_sha: Some(rc.clone()),
+                remote_version: None,
                 update_available: false,
                 status: Status::Same,
                 ref_kind: RefKind::Commit,
                 requested_ref: src.requested_ref.clone(),
                 error: None,
                 note,
-            }));
+            };
+            progress.done(i, true, status_line(&status));
+            statuses.push(Some(status));
             continue;
         }
         jobs.push(RemoteJob {
@@ -902,8 +934,20 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
         }
         drop(res_tx);
         let mut fresh_entries: Vec<compare::CacheEntry> = Vec::new();
-        for _ in 0..jobs.len() {
-            let (index, result) = res_rx.recv().expect("all workers exited early");
+        let mut received = 0usize;
+        while received < jobs.len() {
+            let (index, result) = match res_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(r) => r,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Nothing arrived: animate the in-flight rows. The
+                    // channel cannot disconnect before every result arrived,
+                    // so a timeout is just a paint tick.
+                    progress.tick();
+                    continue;
+                }
+            };
+            received += 1;
             let job = &jobs[index];
             fresh_entries.extend(result.cache_entries.clone());
             let status = PluginStatus {
@@ -913,6 +957,7 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 version: job.version.clone(),
                 installed_sha: job.installed_sha.clone(),
                 remote_sha: result.remote_sha,
+                remote_version: result.remote_version,
                 update_available: result.status == Status::Behind,
                 status: result.status,
                 ref_kind: ref_kind(job.requested_ref.as_deref()),
@@ -920,12 +965,14 @@ fn collect(cfg: &Config, only: Option<&str>) -> Result<Vec<PluginStatus>, String
                 error: result.error,
                 note: None,
             };
+            progress.done(job.index, status.error.is_none(), status_line(&status));
             statuses[job.index] = Some(status);
         }
         if let Some(dir) = config_dir.as_deref() {
             compare::merge_cache(dir, fresh_entries);
         }
     });
+    progress.finish();
 
     Ok(statuses.into_iter().flatten().collect())
 }
@@ -935,6 +982,7 @@ struct JobResult {
     remote_sha: Option<String>,
     status: Status,
     error: Option<String>,
+    remote_version: Option<String>,
     cache_entries: Vec<compare::CacheEntry>,
 }
 
@@ -954,6 +1002,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
                 remote_sha: None,
                 status: Status::Unknown,
                 error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
+                remote_version: None,
                 cache_entries: Vec::new(),
             }
         }
@@ -962,6 +1011,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
                 remote_sha: None,
                 status: Status::Unknown,
                 error: Some(e),
+                remote_version: None,
                 cache_entries: Vec::new(),
             }
         }
@@ -971,9 +1021,14 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
             remote_sha: Some(remote),
             status: Status::Same,
             error: None,
+            remote_version: None,
             cache_entries: Vec::new(),
         };
     }
+    // The remote ref changed: resolve a human version name for the display
+    // (newest tag, or the pinned tag itself). Best-effort and only paid for
+    // plugins that actually moved.
+    let remote_version = remote_version_for(job, timeout_secs);
     // Ref changed: classify via the compare API (cached). Failure degrades
     // to Unknown - we cannot prove it is a fast-forward, so no update.
     match compare::classify(
@@ -988,33 +1043,69 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
             remote_sha: Some(remote),
             status: Status::Same,
             error: None,
+            remote_version: None,
             cache_entries: Vec::new(),
         },
         Ok(compare::CompareStatus::Ahead) => JobResult {
             remote_sha: Some(remote.clone()),
             status: Status::Behind,
             error: None,
+            remote_version,
             cache_entries: cache_entry(job, &remote, compare::CompareStatus::Ahead),
         },
         Ok(compare::CompareStatus::Behind) => JobResult {
             remote_sha: Some(remote.clone()),
             status: Status::Ahead,
             error: None,
+            remote_version,
             cache_entries: cache_entry(job, &remote, compare::CompareStatus::Behind),
         },
         Ok(compare::CompareStatus::Diverged) => JobResult {
             remote_sha: Some(remote.clone()),
             status: Status::Diverged,
             error: None,
+            remote_version,
             cache_entries: cache_entry(job, &remote, compare::CompareStatus::Diverged),
         },
         Err(e) => JobResult {
             remote_sha: Some(remote),
             status: Status::Unknown,
             error: Some(e),
+            remote_version: None,
             cache_entries: Vec::new(),
         },
     }
+}
+
+/// Human-readable upstream version for a changed plugin: the pinned tag name
+/// when the plugin tracks a tag, else the newest `refs/tags/*` from
+/// `git ls-remote --tags --sort=-v:refname` (client-side version sort).
+/// Best-effort display metadata; any failure yields `None` (the caller then
+/// falls back to the short SHA).
+fn remote_version_for(job: &RemoteJob, timeout_secs: u64) -> Option<String> {
+    if let Some(r) = &job.requested_ref {
+        if let Some(tag) = r.strip_prefix("refs/tags/") {
+            return Some(tag.to_string());
+        }
+    }
+    let url = format!("https://github.com/{}/{}", job.owner, job.repo);
+    let mut args: Vec<&str> = GIT_TIMEOUT_ARGS.to_vec();
+    args.extend(["ls-remote", "--tags", "--sort=-v:refname", &url]);
+    let out = run_with_timeout(&git_bin(), &args, timeout_secs).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let _sha = it.next()?;
+            let r = it.next()?;
+            r.strip_prefix("refs/tags/")
+                .map(str::to_string)
+                .filter(|t| !t.is_empty() && !t.ends_with("^{}"))
+        })
+        .next()
 }
 
 fn cache_entry(
@@ -1066,51 +1157,62 @@ fn remote_head(
 }
 
 /// Run an external binary with a wall-clock deadline. `timeout_secs == 0`
-/// disables the deadline. The child's stdout/stderr are read to completion
-/// so the pipe buffer cannot fill up and stall the child past the deadline;
-/// a timed-out process is killed and reaped before we return.
+/// disables the deadline. stdout/stderr are drained on reader threads while
+/// the child runs, so a chatty child (e.g. the GitHub compare API returning
+/// a multi-hundred-KB JSON body) can never fill the pipe buffer and deadlock
+/// against the wait loop; a timed-out process is killed and reaped before we
+/// return.
 pub fn run_with_timeout(bin: &str, args: &[&str], timeout_secs: u64) -> Result<Output, String> {
     let mut child = Command::new(bin)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run git: {e}"))?;
+        .map_err(|e| format!("cannot run {bin}: {e}"))?;
     if timeout_secs == 0 {
         return child
             .wait_with_output()
-            .map_err(|e| format!("cannot run git: {e}"));
+            .map_err(|e| format!("cannot run {bin}: {e}"));
     }
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stderr = stderr;
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let _ = stdout.read_to_end(&mut out);
-                let _ = stderr.read_to_end(&mut err);
-                return Ok(Output {
-                    status,
-                    stdout: out,
-                    stderr: err,
-                });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_process_tree(&mut child);
-                    return Err(format!("git ls-remote timed out after {timeout_secs}s"));
+                    return Err(format!("{bin} timed out after {timeout_secs}s"));
                 }
             }
             Err(e) => {
                 kill_process_tree(&mut child);
-                return Err(format!("cannot wait for git: {e}"));
+                return Err(format!("cannot wait for {bin}: {e}"));
             }
         }
         // Brief sleep so a hung child does not busy-spin the worker.
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Terminate the child and its whole process tree, then reap it.
@@ -1149,40 +1251,46 @@ fn git_bin() -> String {
         .unwrap_or_else(|| "git".to_string())
 }
 
-fn print_status(s: &PluginStatus) {
+/// The final report line for a plugin status, e.g.
+/// `[flock.farm] up to date (v0.1.0)`. Also used as the live-panel row
+/// label, so the panel and the report agree.
+fn status_line(s: &PluginStatus) -> String {
     if let Some(err) = &s.error {
-        println!("  [{}] error: {err}", s.plugin_id);
-        return;
+        return format!("[{}] error: {err}", s.plugin_id);
     }
+    let from = version_str(&s.version, &s.installed_sha);
     match s.status {
-        Status::Behind => println!(
-            "  [{}] update available: {} -> {}",
+        Status::Behind => format!(
+            "[{}] update available: {from} -> {}",
             s.plugin_id,
-            short(&s.installed_sha),
-            short(s.remote_sha.as_deref().unwrap_or("?"))
+            version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"))
         ),
-        Status::Ahead => println!(
-            "  [{}] ahead of upstream ({} -> {})",
+        Status::Ahead => format!(
+            "[{}] ahead of upstream ({from} -> {})",
             s.plugin_id,
-            short(&s.installed_sha),
-            short(s.remote_sha.as_deref().unwrap_or("?"))
+            version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"))
         ),
-        Status::Diverged => println!(
-            "  [{}] diverged from upstream ({} -> {})",
+        Status::Diverged => format!(
+            "[{}] diverged from upstream ({from} -> {})",
             s.plugin_id,
-            short(&s.installed_sha),
-            short(s.remote_sha.as_deref().unwrap_or("?"))
+            version_str(&s.remote_version, s.remote_sha.as_deref().unwrap_or("?"))
         ),
-        Status::Unknown => println!(
-            "  [{}] unknown ({} -> ?)",
-            s.plugin_id,
-            short(&s.installed_sha)
-        ),
-        Status::Same => println!(
-            "  [{}] up to date ({})",
-            s.plugin_id,
-            short(&s.installed_sha)
-        ),
+        Status::Unknown => format!("[{}] unknown ({from} -> ?)", s.plugin_id),
+        Status::Same => format!("[{}] up to date ({from})", s.plugin_id),
+    }
+}
+
+fn print_status(s: &PluginStatus) {
+    println!("  {}", status_line(s));
+}
+
+/// Human version label: the resolved version (manifest / tag) prefixed with
+/// `v` for consistency, else the short commit SHA. Display only.
+fn version_str(v: &Option<String>, sha: &str) -> String {
+    match v.as_deref().filter(|s| !s.is_empty()) {
+        Some(v) if v.starts_with('v') => v.to_string(),
+        Some(v) => format!("v{v}"),
+        None => short(sha).to_string(),
     }
 }
 

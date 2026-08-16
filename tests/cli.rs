@@ -30,6 +30,16 @@ for a in "$@"; do
     refs/*) ref="$a" ;;
   esac
 done
+case "$*" in
+  *--tags*)
+    case "$url" in
+      *herdr-flock*) echo "1111111111111111111111111111111111111111 refs/tags/v0.1.0" ;;
+      *herdr-file-viewer*) echo "2222222222222222222222222222222222222222 refs/tags/v1.15.0" ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+    ;;
+esac
 case "$url" in
   *herdr-flock*)
     if [ -n "$ref" ]; then
@@ -49,6 +59,14 @@ for %%a in (%*) do (\r\n\
   echo %%a | findstr /c:\"refs/\" >nul\r\n\
   if not errorlevel 1 set \"has_ref=yes\"\r\n\
 )\r\n\
+echo %* | findstr /c:\"--tags\" >nul\r\n\
+if not errorlevel 1 (\r\n\
+  echo %* | findstr /c:\"herdr-flock\" >nul\r\n\
+  if not errorlevel 1 ( echo 1111111111111111111111111111111111111111 refs/tags/v0.1.0 & exit /b 0 )\r\n\
+  echo %* | findstr /c:\"herdr-file-viewer\" >nul\r\n\
+  if not errorlevel 1 ( echo 2222222222222222222222222222222222222222 refs/tags/v1.15.0 & exit /b 0 )\r\n\
+  exit /b 1\r\n\
+)\r\n\
 echo %* | findstr /c:\"herdr-flock\" >nul\r\n\
 if not errorlevel 1 (\r\n\
   if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 HEAD & exit /b 0 )\r\n\
@@ -67,6 +85,10 @@ if [ "$1" = "plugin" ] && [ "$2" = "install" ]; then
   echo "$@" >> "$(dirname "$0")/installs.log"
   exit 0
 fi
+if [ "$1" = "plugin" ] && [ "$2" = "config-dir" ]; then
+  echo "$(dirname "$0")/plugin-config"
+  exit 0
+fi
 if [ "$1" = "notification" ] && [ "$2" = "show" ]; then
   echo "$@" >> "$(dirname "$0")/notifications.log"
   exit 0
@@ -81,6 +103,10 @@ if \"%1\"==\"plugin\" if \"%2\"==\"list\" (\r\n\
 )\r\n\
 if \"%1\"==\"plugin\" if \"%2\"==\"install\" (\r\n\
   echo %*>> \"%~dp0installs.log\"\r\n\
+  exit /b 0\r\n\
+)\r\n\
+if \"%1\"==\"plugin\" if \"%2\"==\"config-dir\" (\r\n\
+  echo %~dp0plugin-config\r\n\
   exit /b 0\r\n\
 )\r\n\
 if \"%1\"==\"notification\" if \"%2\"==\"show\" (\r\n\
@@ -217,7 +243,7 @@ fn check_reports_status_and_exit_2_when_errors() {
     // are errors, which take precedence over pending updates.
     assert_eq!(out.status.code(), Some(2));
     let s = stdout_of(&out);
-    assert!(s.contains("up to date (ae24844b)"), "flock: {s}");
+    assert!(s.contains("up to date (v0.1.0)"), "flock: {s}");
     assert!(s.contains("update available"), "file-viewer: {s}");
     assert!(s.contains("cannot resolve remote HEAD"), "wave-tui: {s}");
     assert!(s.contains("invalid owner/repo"), "evil: {s}");
@@ -225,6 +251,23 @@ fn check_reports_status_and_exit_2_when_errors() {
         s.contains("github source missing owner/repo/commit fields"),
         "broken: {s}"
     );
+}
+
+#[test]
+fn check_shows_version_names_not_shas() {
+    let dir = setup("check-versions");
+    let out = run(&dir, &["check"], None);
+    assert_eq!(out.status.code(), Some(2)); // REGISTRY has error entries
+    let s = stdout_of(&out);
+    // Installed versions come from the registry manifest; the remote version
+    // from the newest tag (stub git emits refs/tags/ lines for --tags).
+    assert!(s.contains("[flock.farm] up to date (v0.1.0)"), "{s}");
+    assert!(
+        s.contains("update available: v1.14.0 -> v1.15.0"),
+        "remote version must come from the newest tag: {s}"
+    );
+    // A plugin without a manifest version keeps the short-SHA fallback.
+    assert!(s.contains("[pinned.stable] up to date (11111111)"), "{s}");
 }
 
 #[test]
@@ -1191,6 +1234,28 @@ fn commit_pin_is_never_updateable() {
     let joined = joined.join("\n");
     assert!(joined.contains("status: same"), "{joined}");
     assert!(joined.contains("action: HOLD"), "{joined}");
+}
+
+#[test]
+fn standalone_resolves_plugin_config_dir_via_herdr() {
+    // A standalone run (no HERDR_PLUGIN_CONFIG_DIR, no --config) must find
+    // the plugin config through `herdr plugin config-dir` and honor it -
+    // this is what makes `policy = "auto"` work when the user runs
+    // `herdr-auto-update update` directly from a shell.
+    let dir = setup("standalone-config");
+    std::fs::create_dir_all(dir.join("plugin-config")).unwrap();
+    std::fs::write(dir.join("plugin-config/config.toml"), "policy = \"auto\"\n").unwrap();
+    let out = run(&dir, &["update"], None);
+    let log = installs(&dir);
+    assert!(
+        log.contains("smarzban/herdr-file-viewer"),
+        "policy=auto from the plugin config dir must install: {log}"
+    );
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !e.contains("policy` is not set"),
+        "config with explicit policy must not warn: {e}"
+    );
 }
 
 #[test]

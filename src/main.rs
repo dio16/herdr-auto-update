@@ -4,6 +4,7 @@
 
 mod compare;
 mod config;
+mod progress;
 mod registry;
 mod state;
 mod updater;

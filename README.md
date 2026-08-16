@@ -39,6 +39,14 @@ which replaces the managed checkout while preserving plugin config and state.
   `allow` owner/repo globs. A one-line stderr note is printed while `policy`
   is unset.
 - Dry-run `plan` command and explicit `apply`, both scriptable via `--json`.
+- Live progress panel on terminals: an animated per-plugin view (spinner,
+  ✓/✗, and an overall progress bar) while checks and updates run. Auto-
+  disabled for piped output and `--json`, so herdr logs and scripts see the
+  same stable line-based report as before.
+- Human-readable version transitions in reports (`v1.0.1 -> v1.0.2`): the
+  installed version comes from the plugin manifest, the upstream version
+  from the newest release tag. Plugins without versions fall back to commit
+  SHAs.
 - Linux, macOS, and Windows support; Rust binary with argv-based subprocess
   calls (no shell interpolation).
 
@@ -93,7 +101,10 @@ list` prints the exact ids for your platform.
 
 The plugin reads `config.toml` from its plugin config directory (created by
 herdr on install; print the path with `herdr plugin config-dir
-herdr-auto-update`):
+herdr-auto-update`). When herdr runs the plugin it injects the directory via
+env vars; a standalone `herdr-auto-update` run resolves the same directory
+through `herdr plugin config-dir`, so shell invocations and herdr's own
+startup hook always read the same config:
 
 ```toml
 # Reinstall outdated plugins automatically at server startup (default true).

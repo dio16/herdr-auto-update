@@ -187,7 +187,30 @@ fn default_path() -> Option<PathBuf> {
             return Some(PathBuf::from(root).join("config").join("config.toml"));
         }
     }
-    None
+    herdr_plugin_config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// Standalone fallback for the plugin config dir: when herdr is not running
+/// the plugin (no injected env vars), ask herdr where the plugin config dir
+/// is. Mirrors the registry access pattern - the herdr CLI is the single
+/// source of truth for paths, no per-platform data-dir guessing. This is
+/// what makes a standalone `herdr-auto-update update` read the same
+/// config.toml that herdr's own startup hook reads.
+fn herdr_plugin_config_dir() -> Option<PathBuf> {
+    let bin = crate::registry::herdr_bin();
+    let out = std::process::Command::new(&bin)
+        .args(["plugin", "config-dir", env!("CARGO_PKG_NAME")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = crate::registry::decode_stdout(&out.stdout);
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(dir))
 }
 
 /// Directory for plugin-owned data files (`state.json`, `compare-cache.json`).
@@ -208,7 +231,7 @@ pub fn config_dir(override_path: Option<&str>) -> Option<PathBuf> {
             return Some(PathBuf::from(root).join("config"));
         }
     }
-    None
+    herdr_plugin_config_dir()
 }
 
 #[cfg(test)]
@@ -277,7 +300,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         assert_eq!(config_dir(Some(path.to_str().unwrap())), Some(dir.clone()));
+        // No env vars and herdr unreachable -> nothing to resolve. The herdr
+        // fallback must not depend on a live herdr being installed.
+        let saved_bin = std::env::var("HERDR_BIN_PATH").ok();
+        let saved_dir = std::env::var("HERDR_PLUGIN_CONFIG_DIR").ok();
+        let saved_root = std::env::var("HERDR_PLUGIN_ROOT").ok();
+        std::env::set_var("HERDR_BIN_PATH", "hau-definitely-not-a-herdr");
+        std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR");
+        std::env::remove_var("HERDR_PLUGIN_ROOT");
         assert_eq!(config_dir(None), None);
+        match saved_bin {
+            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
+            None => std::env::remove_var("HERDR_BIN_PATH"),
+        }
+        match saved_dir {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+        match saved_root {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_ROOT", v),
+            None => std::env::remove_var("HERDR_PLUGIN_ROOT"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

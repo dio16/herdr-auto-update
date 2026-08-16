@@ -71,7 +71,7 @@ pub fn list_installed() -> Result<Vec<Plugin>, String> {
 }
 
 /// herdr may write UTF-16LE to a console pipe; detect the BOM and decode.
-fn decode_stdout(bytes: &[u8]) -> String {
+pub(crate) fn decode_stdout(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) {
         let mut units = Vec::with_capacity(bytes.len() / 2);
         for chunk in bytes[2..].chunks_exact(2) {
